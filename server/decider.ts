@@ -1,0 +1,346 @@
+import {
+	OnlyneError,
+	type Action,
+	type DeliveryPlan,
+	type Entry,
+	type Json,
+	type MessageRef,
+	type MsgInput,
+	type NodeId,
+	type Thread,
+	type ThreadRef,
+} from "@onlyne/lib";
+import { choice, judge, noul, type JudgeConfig, type Question } from "./systemone.ts";
+
+export interface InboundDecision {
+	action: "wake" | "fragment";
+	insertion?: "steer" | "follow_up";
+	/** The model's answer to whether the sender is owed a reply; the host renders it. */
+	needsAnswer: boolean;
+}
+
+export interface DeciderDeps {
+	nodeId: NodeId;
+	judge: JudgeConfig;
+	/** Verified peers from the library's discovery records. */
+	listPeers(): Promise<Array<{ node_id: NodeId; base_url: string }>>;
+	listThreads(): Promise<Thread[]>;
+	listMessages(thread: ThreadRef, cursor?: string): Promise<{ items: Entry[] }>;
+	/** Contexts this node publishes for `execution: existing`; Carly is one session. */
+	receiverContexts(): Promise<Array<{ alias: string; summary: string; state: string }>>;
+}
+
+const INTENTS = ["communicate", "inspect", "manage_thread", "manage_domain", "operate_resource"] as const;
+const SCOPES = ["directory", "neighbors", "threads", "inbox", "messages", "message"] as const;
+const THREAD_OPS = ["create", "close", "list", "describe", "member_add", "member_remove"] as const;
+const DOMAIN_OPS = ["create", "join", "leave", "list", "describe", "discover"] as const;
+const RESPONSES = ["none", "async", "await"] as const;
+const EXECUTIONS = ["existing", "new"] as const;
+
+function record(value: unknown): Record<string, Json> | undefined {
+	return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, Json> : undefined;
+}
+
+function text(source: Record<string, Json> | undefined, key: string): string | undefined {
+	const value = source?.[key];
+	return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function threadRef(value: Json | undefined): ThreadRef | undefined {
+	const source = record(value);
+	const owner = text(source, "owner");
+	const id = text(source, "id");
+	return owner === undefined || id === undefined ? undefined : { owner, id };
+}
+
+function messageRef(value: Json | undefined): MessageRef | undefined {
+	const source = record(value);
+	const sender = text(source, "sender");
+	const id = text(source, "id");
+	return sender === undefined || id === undefined ? undefined : { sender, id };
+}
+
+function oneOf<T extends string>(value: Json | undefined, allowed: readonly T[], field: string): T | undefined {
+	if (value === undefined) return undefined;
+	if (typeof value === "string" && (allowed as readonly string[]).includes(value)) return value as T;
+	throw new OnlyneError("invalid_request", `meta.${field} must be one of ${allowed.join(", ")}.`);
+}
+
+/**
+ * The outbound and inbound decision tree for Carly. Every semantic choice goes through
+ * System One; explicit meta fields are honored without a call. The tree follows
+ * omp-onlyne's stages (intent, target, plan, scope, thread, domain) with one host
+ * difference: Carly has exactly one execution context, so inbound routing is fixed.
+ */
+export class CarlyDecider {
+	constructor(private readonly deps: DeciderDeps) {}
+
+	async decide(input: MsgInput): Promise<Action> {
+		const meta = input.meta ?? {};
+		const explicit = this.#explicit(meta);
+		if (explicit !== undefined) return explicit;
+		const intent = await this.#intent(input);
+		if (intent === "communicate") return this.#communicate(input, meta);
+		if (intent === "inspect") return this.#inspect(input, meta);
+		if (intent === "manage_thread") return this.#thread(meta);
+		if (intent === "manage_domain") return this.#domain(meta);
+		const resource = record(meta.resource);
+		const operation = text(meta, "operation");
+		if (resource === undefined || operation === undefined) {
+			throw new OnlyneError("invalid_request", "A resource action needs meta.resource and meta.operation.");
+		}
+		const owner = text(resource, "owner");
+		const id = text(resource, "id");
+		if (owner === undefined || id === undefined) throw new OnlyneError("invalid_request", "meta.resource needs owner and id.");
+		return { kind: "resource", resource: { owner, id }, operation, ...(meta.data === undefined ? {} : { data: meta.data }) };
+	}
+
+	/** Stable meta fields route without a judgment; everything semantic asks the model. */
+	#explicit(meta: Record<string, Json>): Action | undefined {
+		const op = text(meta, "op");
+		if (meta.to !== undefined) {
+			const to = text(meta, "to");
+			if (to === undefined) throw new OnlyneError("invalid_request", "meta.to must be a node id.");
+			const response = oneOf(meta.response, RESPONSES, "response");
+			const execution = oneOf(meta.execution, EXECUTIONS, "execution");
+			return {
+				kind: "send", to,
+				...(threadRef(meta.thread) === undefined ? {} : { thread: threadRef(meta.thread) }),
+				...(messageRef(meta.in_reply_to) === undefined ? {} : { in_reply_to: messageRef(meta.in_reply_to) }),
+				...(oneOf(meta.relation, ["reply", "followup"] as const, "relation") === undefined ? {} : { relation: oneOf(meta.relation, ["reply", "followup"] as const, "relation") }),
+				...(Array.isArray(meta.mentions) ? { mentions: meta.mentions.filter((value): value is string => typeof value === "string") } : {}),
+				response: response ?? "async", execution: execution ?? "existing",
+			};
+		}
+		if (op !== undefined && (THREAD_OPS as readonly string[]).includes(op)) {
+			return { kind: "thread", op: op as Action extends { kind: "thread"; op: infer O } ? O : never,
+				...(threadRef(meta.thread) === undefined ? {} : { thread: threadRef(meta.thread) }),
+				...(text(meta, "title") === undefined ? {} : { title: text(meta, "title") }),
+				...(text(meta, "member") === undefined ? {} : { to: text(meta, "member") }) };
+		}
+		if (op !== undefined && (DOMAIN_OPS as readonly string[]).includes(op)) {
+			return { kind: "domain", op: op as "create" | "join" | "leave" | "list" | "describe" | "discover",
+				...(text(meta, "domain_id") === undefined ? {} : { domain_id: text(meta, "domain_id") }) };
+		}
+		return undefined;
+	}
+
+	async #intent(input: MsgInput): Promise<(typeof INTENTS)[number]> {
+		const answers = await judge(this.deps.judge,
+			{ focus: { delivery_kind: input.delivery_kind, msg: input.msg, meta: input.meta ?? null } },
+			{
+				intent: {
+					type: "choice",
+					instructions: "Choose the one action this message asks for. communicate: deliver a message, reply or progress note to another agent. inspect: look up local or network state. manage_thread: create, close, describe or change members of a thread. manage_domain: manage this node's domain membership. operate_resource: operate a resource the message names explicitly.",
+					criteria: {
+						communicate: "The message is meant for another agent or node, including asking a peer something.",
+						inspect: "The message asks to see node-level state: who is online, the inbox, a thread's messages, one message, or delivery evidence.",
+						manage_thread: "The message works on threads themselves: list, describe, create, close, add or remove a member.",
+						manage_domain: "The message changes or reads this node's domain membership.",
+						operate_resource: "meta.resource names an external resource to operate.",
+					},
+				},
+			});
+		const intent = choice(answers, "intent", INTENTS);
+		if (intent === undefined) throw new OnlyneError("decision_unavailable", "The decision did not choose an outbound intent.");
+		return intent;
+	}
+
+	async #communicate(input: MsgInput, meta: Record<string, Json>): Promise<Action> {
+		const reply = messageRef(meta.in_reply_to);
+		const relation = oneOf(meta.relation, ["reply", "followup"] as const, "relation") ?? (reply === undefined ? undefined : "reply");
+		if (relation !== undefined && reply === undefined) throw new OnlyneError("invalid_request", "A relation needs meta.in_reply_to.");
+		const to = await this.#target(input, meta, reply);
+		const thread = await this.#sendThread(meta, to);
+		const response = oneOf(meta.response, RESPONSES, "response");
+		const execution = oneOf(meta.execution, EXECUTIONS, "execution");
+		const plan = response !== undefined && execution !== undefined
+			? { response, execution }
+			: await this.#plan(input, relation !== undefined);
+		const mentions = Array.isArray(meta.mentions)
+			? meta.mentions.filter((value): value is string => typeof value === "string")
+			: undefined;
+		return {
+			kind: "send", to,
+			...(thread === undefined ? {} : { thread }),
+			...(reply === undefined ? {} : { in_reply_to: reply }),
+			...(relation === undefined ? {} : { relation }),
+			...(mentions === undefined || mentions.length === 0 ? {} : { mentions }),
+			response: plan.response, execution: plan.execution,
+		};
+	}
+
+	async #target(input: MsgInput, meta: Record<string, Json>, reply: MessageRef | undefined): Promise<NodeId> {
+		if (reply !== undefined) return reply.sender;
+		const explicit = text(meta, "to");
+		if (explicit !== undefined) return explicit;
+		const peers = await this.deps.listPeers();
+		if (peers.length === 0) throw new OnlyneError("not_found", "No peer is known yet; discover or add one first.");
+		if (peers.length === 1) return peers[0]!.node_id;
+		const answers = await judge(this.deps.judge,
+			{ focus: { delivery_kind: input.delivery_kind, msg: input.msg, meta: meta }, peers: peers.map(peer => ({ node_id: peer.node_id, base_url: peer.base_url })) },
+			{
+				target: {
+					type: "choice",
+					instructions: "Choose the peer this message addresses.",
+					criteria: Object.fromEntries(peers.map(peer => [peer.node_id, peer.base_url])),
+				},
+			});
+		const chosen = choice(answers, "target", peers.map(peer => peer.node_id));
+		if (chosen === undefined) throw new OnlyneError("decision_unavailable", "The decision did not choose a target.");
+		return chosen;
+	}
+
+	async #sendThread(meta: Record<string, Json>, to: NodeId): Promise<ThreadRef | undefined> {
+		const value = meta.thread;
+		if (value === undefined) return undefined;
+		const ref = threadRef(value);
+		if (ref !== undefined) return ref;
+		if (typeof value !== "string" || value.length === 0) throw new OnlyneError("invalid_request", "meta.thread must be a thread id, alias or {owner,id}.");
+		const threads = await this.deps.listThreads();
+		const matches = threads.filter(thread => thread.thread_ref.id === value || thread.title === value);
+		if (matches.length > 1) throw new OnlyneError("ambiguous_target", `More than one local thread is named ${value}.`);
+		if (matches.length === 1) return matches[0]!.thread_ref;
+		const slash = value.indexOf("/");
+		if (slash > 0 && slash < value.length - 1) return { owner: value.slice(0, slash), id: value.slice(slash + 1) };
+		return { owner: to, id: value };
+	}
+
+	async #plan(input: MsgInput, isReply: boolean): Promise<{ response: "none" | "async" | "await"; execution: "existing" | "new" }> {
+		const questions: Record<string, Question> = {
+			response: {
+				type: "choice",
+				instructions: "Two facts decide: does the receiver have to act, and can the sender continue without the answer?",
+				criteria: {
+					none: "The receiver need not act at all: a notice, a status update, '不用回'.",
+					async: "The receiver must act, but the sender keeps working and picks the answer up later.",
+					await: "The receiver must act and the sender's next step cannot start without the answer.",
+				},
+			},
+			execution: {
+				type: "choice",
+				instructions: "Should the receiver handle this in an existing execution context or in a new one?",
+				criteria: {
+					existing: isReply ? "The message continues work the receiver already knows." : "The message belongs to work already running.",
+					new: "The message starts independent work.",
+				},
+			},
+		};
+		const answers = await judge(this.deps.judge,
+			{ focus: { delivery_kind: input.delivery_kind, msg: input.msg, meta: input.meta ?? null }, relation: isReply ? "reply" : "new" },
+			questions);
+		const response = choice(answers, "response", RESPONSES);
+		const execution = choice(answers, "execution", EXECUTIONS);
+		if (response === undefined || execution === undefined) {
+			throw new OnlyneError("decision_unavailable", "The decision did not choose a delivery plan.");
+		}
+		return { response, execution };
+	}
+
+	async #inspect(input: MsgInput, meta: Record<string, Json>): Promise<Action> {
+		const explicit = oneOf(meta.scope, SCOPES, "scope");
+		const scope = explicit ?? await this.#scope(input);
+		const thread = threadRef(meta.thread);
+		const message = messageRef(meta.message);
+		return {
+			kind: "read", scope,
+			...(thread === undefined ? {} : { thread }),
+			...(message === undefined ? {} : { message }),
+			...(text(meta, "seq") === undefined ? {} : { seq: text(meta, "seq") }),
+			...(text(meta, "cursor") === undefined ? {} : { cursor: text(meta, "cursor") }),
+			...(typeof meta.page_size === "number" ? { page_size: meta.page_size } : {}),
+			...(meta.attention === "inbox" || meta.attention === "thread" ? { attention: meta.attention } : {}),
+		};
+	}
+
+	async #scope(input: MsgInput): Promise<(typeof SCOPES)[number]> {
+		const answers = await judge(this.deps.judge,
+			{ focus: { delivery_kind: input.delivery_kind, msg: input.msg, meta: input.meta ?? null } },
+			{
+				scope: {
+					type: "choice",
+					instructions: "Choose what to read.",
+					criteria: {
+						directory: "The discovery directory of known peers.",
+						neighbors: "Known nodes with their trust state.",
+						threads: "The local thread registry.",
+						inbox: "Unconsumed inbound messages.",
+						messages: "The messages of one thread.",
+						message: "One message.",
+					},
+				},
+			});
+		const scope = choice(answers, "scope", SCOPES);
+		if (scope === undefined) throw new OnlyneError("decision_unavailable", "The decision did not choose a read scope.");
+		return scope;
+	}
+
+	async #thread(meta: Record<string, Json>): Promise<Action> {
+		const op = oneOf(meta.op, THREAD_OPS, "op") ?? await this.#op("thread", THREAD_OPS);
+		const thread = threadRef(meta.thread);
+		const member = text(meta, "member");
+		const title = text(meta, "title");
+		if ((op === "member_add" || op === "member_remove") && member === undefined) {
+			throw new OnlyneError("invalid_request", `A thread ${op} needs meta.member.`);
+		}
+		if (op === "create" && title === undefined) throw new OnlyneError("invalid_request", "A thread create needs meta.title.");
+		return { kind: "thread", op,
+			...(thread === undefined ? {} : { thread }),
+			...(member === undefined ? {} : { to: member }),
+			...(title === undefined ? {} : { title }) };
+	}
+
+	async #domain(meta: Record<string, Json>): Promise<Action> {
+		const op = oneOf(meta.op, DOMAIN_OPS, "op") ?? await this.#op("domain", DOMAIN_OPS);
+		const domain = text(meta, "domain_id");
+		if (op !== "create" && op !== "list" && domain === undefined) throw new OnlyneError("invalid_request", `A domain ${op} needs meta.domain_id.`);
+		return { kind: "domain", op, ...(domain === undefined ? {} : { domain_id: domain }) };
+	}
+
+	async #op<T extends string>(kind: "thread" | "domain", allowed: readonly T[]): Promise<T> {
+		const answers = await judge(this.deps.judge,
+			{ focus: { kind, meta: null } },
+			{
+				op: {
+					type: "choice",
+					instructions: `Choose the ${kind} operation this message asks for.`,
+					criteria: Object.fromEntries(allowed.map(value => [value, value])),
+				},
+			});
+		const op = choice(answers, "op", allowed);
+		if (op === undefined) throw new OnlyneError("decision_unavailable", `The decision did not choose a ${kind} operation.`);
+		return op;
+	}
+
+	/**
+	 * Carly has one execution context. The question is only whether the message owes an
+	 * answer; the insertion mode is a follow-up either way so a running turn keeps going.
+	 */
+	async decideInbound(entry: Entry, _plan?: DeliveryPlan): Promise<InboundDecision> {
+		if (_plan?.response === "none") {
+			return { action: "wake", insertion: "follow_up", needsAnswer: false };
+		}
+		const answers = await judge(this.deps.judge,
+			{
+				focus: {
+					node: this.deps.nodeId,
+					incoming: {
+						sender: entry.authenticated_author,
+						delivery_kind: entry.message.delivery_kind,
+						msg: entry.message.msg,
+						relation: entry.message.meta?.relation ?? null,
+					},
+				},
+			},
+			{
+				needs_answer: {
+					type: "noul",
+					instructions: "Does this message need a reply from the receiver to be complete? A question, a request, or a decision owed to the sender needs one. A notice, greeting, status update or relay does not.",
+					criteria: { true: "The sender is waiting for information or a decision.", false: "Nothing is owed back." },
+				},
+			});
+		const needsAnswer = noul(answers, "needs_answer");
+		if (needsAnswer === undefined) throw new OnlyneError("decision_unavailable", "The decision did not answer the reply obligation.");
+		return { action: "wake", insertion: "follow_up", needsAnswer };
+	}
+}

@@ -1,0 +1,7 @@
+schema = 1
+id = "onlyne"
+name = "Onlyne"
+version = "0.1.0"
+description = "Onlyne agent messaging for Carly: send and receive protocol messages from her Tern window."
+host = "host.luau"
+window = "window.luau"

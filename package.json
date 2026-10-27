@@ -1,0 +1,24 @@
+{
+	"name": "tern-onlyne",
+	"version": "0.1.0",
+	"description": "Tern plugin and companion process that give Carly Onlyne agent messaging",
+	"type": "module",
+	"private": true,
+	"license": "MIT",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/dbydd/tern-onlyne.git"
+	},
+	"scripts": {
+		"check": "tsc --noEmit",
+		"build": "bun build server/main.ts --target=bun --outfile dist/companion.js"
+	},
+	"dependencies": {
+		"@onlyne/lib": "^3.0.0",
+		"@onlyne/node-host": "^3.0.0"
+	},
+	"devDependencies": {
+		"@types/bun": "^1.4.4",
+		"typescript": "^7.0.2"
+	}
+}
