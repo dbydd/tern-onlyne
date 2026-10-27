@@ -33,15 +33,20 @@ tern plugin reload
 | `node_id` | 本节点身份，绝对 URI | 必填 |
 | `region` | 协议归属区域，绝对 URI | 必填 |
 | `bind` | 监听地址 | `127.0.0.1` |
-| `public_url` | 供对端访问的地址 | 绑定地址 |
+| `public_url` | 供对端访问的地址。主机是本机时，它的端口就是本进程绑定的端口；主机是代理时按声明原样公布 | 绑定地址 |
 | `key_scope` | `project` 在磁盘保存 Ed25519 密钥，`none` 关闭签名 | `project` |
 | `wake` | 对需要回复的消息唤醒 Carly | `true` |
+| `acquisition.policy` | `all`、`segment` 或 `none`：对端可以不经人类被获取到哪一步 | `segment` |
+| `acquisition.allow` | `segment` 接受的条目：CIDR 段或主机名，例如 `["127.0.0.0/8", "::1/128", "localhost"]` | 回环 |
+| `trust` | 人类预授权：`[{node_id, fingerprint}]`，不受策略约束 | 无 |
 | `systemone.endpoint` | 判定端点 | `http://127.0.0.1:3425/v1/systemone` |
 | `systemone.model` | 判定模型 | `group/decider` |
 | `systemone.headers` | 额外请求头 | 无 |
 | `systemone.timeout_ms` | 判定超时 | `30000` |
 
-`set_config` 合并补丁后重启伴生进程。
+`set_config` 合并补丁后重启伴生进程。`peers` 是退役键：配置里出现它时伴生进程直接拒绝启动，不会被当成 `acquisition` 读取。
+
+`public_url` 先看主机。回环名、本机某个地址，或解析到这两者的名字，都算本机绑定：它声明的端口在这里绑定（不带端口时按 443 或 80），端口被占用就回落临时端口，endpoint 改写成实际绑定的地址。其余情况按反向代理处理：endpoint 保持声明原样，进程只在 `bind` 上用临时端口监听，启动日志写明「不监听该端口」。
 
 ## 导出
 
@@ -63,7 +68,11 @@ Carly 通过 `plugins["onlyne"]` 调用。
 | `config()` | `onlyne.config` 表。 |
 | `set_config(patch)` | 合并补丁并重启伴生进程。 |
 
-命令面板入口：**Onlyne: 状态**、**Onlyne: 发现的对端**、**Onlyne: 握手状态**、**Onlyne: 处理待收消息**、**Onlyne: 重启伴生进程**、**Onlyne: 打开日志**、**Onlyne: 配置**。
+获取策略拒绝时，`contact`、`trust_begin`、`trust_accept` 与 `refresh` 以 `policy_denied` 和命中的规则失败。`forbidden` 是另一回事：对端撤销了本节点，导出会直接说明，不把它算成策略拒绝。
+
+`msg` 不会一条消息开一个 thread。显式给的 `meta.thread` 优先；回复落在被引用消息所在的 thread；其余情况沿用本节点拥有、成员已含目标对端的最近一个未关闭 thread。`meta.execution = "new"` 是唯一要求另开一段对话的写法。
+
+命令面板入口：**Onlyne: 状态**、**Onlyne: 发现的对端**、**Onlyne: 握手状态**、**Onlyne: 处理待收消息**、**Onlyne: 获取策略**、**Onlyne: 批准对端（人类）**、**Onlyne: 撤销对端（人类）**、**Onlyne: 重启伴生进程**、**Onlyne: 打开日志**、**Onlyne: 配置**。
 
 ## 握手
 
@@ -77,6 +86,43 @@ Carly 通过 `plugins["onlyne"]` 调用。
 阶段含义：`invited` 表示对方等我们批准，`requested` 表示我们等对方批准，`exchanged` 表示双方都已批准，`revoked` 表示批准已撤销。`trust_accept` 之后停在 `requested` 是正常的等待状态。
 
 验签通过的 statement 会顺带把对端地址写入发现目录，所以收到的邀请可以直接批准，不需要事先 `contact`。
+
+## 对端获取策略
+
+宿主决定对端可以不经人类被获取到哪一步。库不读这份策略，它只看到 `trust_accept` 有没有被调用（RFC 0018 §2）。
+
+| 取值 | 含义 |
+| --- | --- |
+| `all` | agent 动作与宿主自动确认接受任意对端。 |
+| `segment`（默认） | 只接受落在 `allow` 内的对端，默认集合是回环。 |
+| `none` | agent 既不发起也不自动确认，批准留给人类面板。 |
+
+求值点在 `/admin/contact`、`/admin/trust/begin`、`/admin/trust/accept`、`/admin/discovery/refresh` 提交任何东西之前，也在宿主自动批准到达的陈述之前。拒绝时返回 HTTP 403 与 `policy_denied`，带上策略、允许集合、原因与命中的规则。
+
+人类面板是最后一道闸，不受策略限制：窗口半边给自己的命令带 `x-onlyne-human: 1`，面向 agent 的导出无法设置这个头。
+
+自动批准要同时满足三个条件（RFC 0018 §2.2）：观测来源地址在 `allow` 内、对端声明的 `base_url` 在 `allow` 内、该对端名下每一条发现记录都在 `allow` 内。被拒的陈述保留原 `invited` 行，并且什么都不拨：声明地址不拨，发现记录里的地址也不拨。
+
+观测地址在陈述到达时按 `(node_id, fingerprint)` 记录，批准时读的是这条记录，不是手上这次连接。声明地址只证明身份，不证明位置，所以它从不单独决定。
+
+声明地址的主机部分是主机名而不是 IP 字面量时，先解析再判定：解析出的每个地址都必须在允许集合内；解析不出来的直接拒绝，因为它的位置是未被证明，而不是被允许。允许集合的条目本身可以是主机名，按名字命中——否则 `bind = "localhost"` 的对端在「回环默认放行」下反而永远批不了。
+
+`trust` 是人类的预授权。列出的 `{node_id, fingerprint}` 在陈述到达时直接到 `exchanged`，不受策略约束；启动时为每个种子写一条人类超控审计，并输出它的节点、指纹与来源文件，让这条绕过路径可见。
+
+## 握手投递
+
+信任变化与业务消息走同一条通道进入 Carly 的会话：`response = "none"`、`execution = "existing"`、`plan.context = "carly"`，落在只有本节点持有的本地 thread `trust-handshake` 上，不向任何地方发送（RFC 0018 §3）。
+
+- `invited` 作为待办到达并唤起一轮。正文带节点、指纹、声明地址、观测地址、策略与判定，以及可执行动作 `trust_accept(node_id, fingerprint)` 或 `trust_revoke(node_id)`。
+- `requested` 照常投递，但不唤起一轮：本地已经没有可做的事，正文写明在等对端。只有 `invited` 计为待办。
+- `exchanged` 与 `revoked` 作为状态更新到达，不索取动作。
+- 策略自动批准的交换只投递一条结果，不要求 agent 做任何事。
+- 去重键是 `(node_id, fingerprint, phase)`：重复陈述不产生新条目，有证明的轮换是新条目，且正文写明它是轮换。
+- 策略为 `none` 时仍然投递，让 agent 知道有人敲门、而自己没有批准权。
+
+拒绝邀请用 `trust_revoke`：库没有独立的 reject，这是它当前唯一的否定动作，不是语义等价物；库加入 reject 入口后再把两者分开。
+
+这条消息是提示，不是协议事实：`trust.list` 与面板仍然是权威。
 
 ## 入站流程
 
@@ -117,7 +163,11 @@ Carly 通过 `plugins["onlyne"]` 调用。
 | `/admin/trust/begin` | POST | 读取对端公钥。 |
 | `/admin/trust/accept` | POST | 批准对端。 |
 | `/admin/trust/revoke` | POST | 撤销批准。 |
+| `/admin/trust/rotate` | POST | 更换本节点密钥并通知每个已批准的对端。 |
+| `/admin/acquisition` | GET | 策略、允许集合、`allow_loopback`、种子、带指纹与观测地址的 invited 行、信任行、发现记录、候选数、最近的审计行与已知限制。 |
 | `/admin/msg` | POST | 发一条消息。 |
+
+每个管理调用都可以带 `x-onlyne-human: 1`。它标记面板动作：跳过获取策略，并在审计里记一条人类超控。面向 agent 的导出从不发送它。
 
 ## 数据与密钥
 
@@ -126,7 +176,7 @@ Carly 通过 `plugins["onlyne"]` 调用。
 | 文件 | 内容 |
 | --- | --- |
 | `kv.json` | `onlyne.config`、`onlyne.restart`、`onlyne.woken`。 |
-| `onlyne.db` | SQLite：thread、消息、发现、收件、发件、判定、上下文。 |
+| `onlyne.db` | SQLite：thread、消息、发现、收件、发件、判定、上下文，以及宿主自己的 `acquisition/` 行（观测、审计、已投递键）。 |
 | `node-key.json` | 节点 Ed25519 密钥材料，权限 `0600`。 |
 | `server.json` | 伴生进程端口、端点、pid 与管理 token，权限 `0600`。 |
 | `onlyne.log` | JSON 日志，超过 1 MB 轮转。 |
@@ -162,6 +212,10 @@ tern plugin types .   # 重新生成 tern.d.luau，供 luau-lsp 使用
 - 回复判定需要 SystemOne 判定端点。发送方声明 `response = "none"` 时跳过判定。
 - 远程对端需要 HTTPS 与可公布地址，loopback 对端走明文 HTTP。
 - 库的候选交换默认跳过 loopback 地址，宿主需要传 `allow_loopback` 才纳入。
+- 观测地址是 TCP 连接的来源，反向代理后面看到的是代理，不是客户端。
+- 声明的主机名会先解析再判定：解析出的每个地址都要在允许集合内，解析不出来即拒绝。跨主机的地址判定细则仍未定义。
+- 伴生进程只提供明文 HTTP，所以回环之外的对端需要一个 TLS 前置，用 `public_url` 公布前置的地址。
+- 本宿主的 `allow_loopback` 固定为假且不可配置，因此回环对端在 `segment` 下可以被自动批准，但不会出现在发现候选里。
 
 ## 许可
 

@@ -33,15 +33,20 @@ The plugin keeps its configuration in `onlyne.config` inside the plugin's kv sto
 | `node_id` | This node's identity, an absolute URI | required |
 | `region` | Protocol membership, an absolute URI | required |
 | `bind` | Listen address | `127.0.0.1` |
-| `public_url` | Address peers should reach | the bound address |
+| `public_url` | Address peers should reach. A local host also names the port this process binds; a proxy host is published verbatim | the bound address |
 | `key_scope` | `project` keeps an Ed25519 key on disk, `none` disables signing | `project` |
 | `wake` | Wake Carly for messages that owe a reply | `true` |
+| `acquisition.policy` | `all`, `segment` or `none`: how far a peer may be acquired without a human | `segment` |
+| `acquisition.allow` | Entries `segment` accepts: CIDR blocks or host names, e.g. `["127.0.0.0/8", "::1/128", "localhost"]` | loopback |
+| `trust` | Human pre-authorization: `[{node_id, fingerprint}]`, outside the policy | none |
 | `systemone.endpoint` | Judge endpoint | `http://127.0.0.1:3425/v1/systemone` |
 | `systemone.model` | Judge model | `group/decider` |
 | `systemone.headers` | Extra request headers | none |
 | `systemone.timeout_ms` | Judge timeout | `30000` |
 
-`set_config` merges the patch and restarts the companion.
+`set_config` merges the patch and restarts the companion. `peers` is a retired key: a configuration that carries it refuses to start instead of being read as `acquisition`.
+
+`public_url` is judged by its host first. A loopback name, one of this machine's own addresses, or a name resolving to either, is a local bind: its declared port is bound here (a URL without one names 443 or 80), and a taken port falls back to a temporary one with the endpoint rewritten to the address really bound. Anything else is a reverse proxy: the endpoint stays exactly as declared, the process binds `bind` on a temporary port, and the startup log says it does not listen on the advertised port.
 
 ## Exports
 
@@ -63,7 +68,11 @@ Carly reaches these as `plugins["onlyne"]`.
 | `config()` | The `onlyne.config` table. |
 | `set_config(patch)` | Merges a patch into `onlyne.config` and restarts the companion. |
 
-Palette commands: **Onlyne: 状态**, **Onlyne: 发现的对端**, **Onlyne: 握手状态**, **Onlyne: 处理待收消息**, **Onlyne: 重启伴生进程**, **Onlyne: 打开日志**, **Onlyne: 配置**.
+`contact`, `trust_begin`, `trust_accept` and `refresh` fail with `policy_denied` and the matched rule when the acquisition policy refuses them. A `forbidden` answer is a different thing: the peer revoked this node, and the export says so instead of blaming the policy.
+
+`msg` does not open a thread per message. An explicit `meta.thread` wins; a reply lands in the thread of the message it answers; anything else continues the most recently created open thread that already holds the target peer. `meta.execution = "new"` is the only request for a separate conversation.
+
+Palette commands: **Onlyne: 状态**, **Onlyne: 发现的对端**, **Onlyne: 握手状态**, **Onlyne: 处理待收消息**, **Onlyne: 获取策略**, **Onlyne: 批准对端（人类）**, **Onlyne: 撤销对端（人类）**, **Onlyne: 重启伴生进程**, **Onlyne: 打开日志**, **Onlyne: 配置**.
 
 ## Handshake
 
@@ -77,6 +86,43 @@ A fingerprint must be shown before it is pinned, so the exchange has two stages:
 Phase meanings: `invited` means their approval waits for yours, `requested` means yours waits for theirs, `exchanged` means both sides approved, `revoked` means approval was dropped. A row that sits at `requested` after `trust_accept` is the normal waiting state.
 
 A verified statement also writes the peer's address into discovery, so an inbound invitation can be accepted without a prior `contact`.
+
+## Peer acquisition policy
+
+The host decides how far a peer may be acquired without a human. The library never reads this policy: the only thing it sees is whether `trust_accept` was called (RFC 0018 §2).
+
+| Policy | Meaning |
+| --- | --- |
+| `all` | Agent actions and host auto-approval accept any peer. |
+| `segment` (default) | Only peers inside `allow`, which defaults to loopback. |
+| `none` | The agent may neither initiate nor auto-confirm; approval stays with the human panel. |
+
+The policy runs before `/admin/contact`, `/admin/trust/begin`, `/admin/trust/accept` and `/admin/discovery/refresh` commit anything, and before the host auto-approves an arriving statement. A refusal answers HTTP 403 with `policy_denied` and the policy, allow set, reason and matched rule.
+
+The human panel is the last gate and is not subject to it: the window half sends `x-onlyne-human: 1` on its own commands, and no agent-facing export can set that header.
+
+Auto-approval needs three conditions (RFC 0018 §2.2): the observed source address is inside `allow`, the peer's declared `base_url` is inside `allow`, and every discovery record for that peer is inside `allow`. A denied statement keeps its `invited` row, and nothing is dialed — not the declared address, not a recorded one.
+
+The observed address is recorded when the statement arrives, keyed by `(node_id, fingerprint)`; the verdict at approval time reads that record, never the connection in hand. A declared address proves identity, not location, so it never decides alone.
+
+A declared address whose host is a name rather than a literal is resolved, and every address it resolves to must be allowed; a name that does not resolve is denied, because its location is unproven rather than permitted. An allow entry may itself be a host name, which matches on the name — otherwise a peer bound to `localhost` could never be approved while loopback is the default.
+
+`trust` is a human pre-authorization. A listed `{node_id, fingerprint}` reaches `exchanged` on its statement, outside the policy, and startup writes one human-override audit row per seed and logs its node, fingerprint and source file, so the bypass stays visible.
+
+## Handshake delivery
+
+Trust changes reach Carly as session messages on the same channel as business messages: `response = "none"`, `execution = "existing"`, `plan.context = "carly"`, on the local thread `trust-handshake`, which only this node holds and which sends nothing anywhere (RFC 0018 §3).
+
+- `invited` arrives as a todo and wakes one turn. The body carries the node, fingerprint, declared address, observed address, the policy and the verdict, plus the executable action `trust_accept(node_id, fingerprint)` or `trust_revoke(node_id)`.
+- `requested` is delivered and does not wake a turn: the local side has nothing left to do, and the body says it is waiting for the peer. Only `invited` counts as a todo.
+- `exchanged` and `revoked` arrive as status updates that ask for nothing.
+- An auto-approved exchange delivers one result entry and asks the agent for no action.
+- The dedupe key is `(node_id, fingerprint, phase)`: a repeated statement adds no entry, and a proven rotation is a new entry whose body says it is a rotation.
+- Policy `none` still delivers, so the agent learns that someone knocked and that it may not approve.
+
+Rejecting an invitation uses `trust_revoke`: the library has no separate reject, so this is the only negative action it offers, not a semantic equivalent. A dedicated reject entry would split the two.
+
+The message is a hint, never protocol state: `trust.list` and the panel remain authoritative.
 
 ## Inbound flow
 
@@ -117,7 +163,11 @@ The companion listens on `bind` and answers two route groups. `/onlyne/v3/*` is 
 | `/admin/trust/begin` | POST | Read a peer key. |
 | `/admin/trust/accept` | POST | Approve a peer. |
 | `/admin/trust/revoke` | POST | Drop approval. |
+| `/admin/trust/rotate` | POST | Replace this node's key and tell every approved peer. |
+| `/admin/acquisition` | GET | Policy, allow set, `allow_loopback`, seeds, invited rows with fingerprint and observed address, trust rows, discovery, candidate count, recent audit rows and the known limitations. |
 | `/admin/msg` | POST | Send one message. |
+
+Every admin call may carry `x-onlyne-human: 1`. It marks a panel action: the acquisition policy is skipped and the audit records a human override. The agent-facing exports never send it.
 
 ## Data and secrets
 
@@ -126,7 +176,7 @@ Everything lives in the plugin data directory, `~/Library/Application Support/Te
 | File | Contents |
 | --- | --- |
 | `kv.json` | `onlyne.config`, `onlyne.restart`, `onlyne.woken`. |
-| `onlyne.db` | SQLite: threads, messages, discovery, inbox, outbox, decisions, contexts. |
+| `onlyne.db` | SQLite: threads, messages, discovery, inbox, outbox, decisions, contexts, and the host's own `acquisition/` rows (observations, audit, delivered keys). |
 | `node-key.json` | The node's Ed25519 key material, mode `0600`. |
 | `server.json` | Companion port, endpoint, pid and admin token, mode `0600`. |
 | `onlyne.log` | JSON log, rotated at 1 MB. |
@@ -162,6 +212,10 @@ The copy lets this repository build against the published `@onlyne/lib` and `@on
 - The reply judgment needs the SystemOne judge. A sender that sets `response = "none"` skips the judge.
 - Remote peers need HTTPS and a published URL. Loopback peers use plain HTTP.
 - The library's candidate exchange skips loopback addresses unless the host passes `allow_loopback`.
+- The observed address is the TCP source. Behind a reverse proxy it is the proxy, not the client.
+- A declared host name is resolved before it is judged: every resolved address must be in the allow set, and a name that does not resolve is denied. Cross-host address rules stay undefined.
+- This companion serves plain HTTP, so a peer outside loopback needs a TLS front; set `public_url` to the address that front publishes.
+- `allow_loopback` is false here and not configurable, so a loopback peer is auto-approved under `segment` but never appears as a discovery candidate.
 
 ## License
 

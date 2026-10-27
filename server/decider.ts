@@ -4,6 +4,7 @@ import {
 	type DeliveryPlan,
 	type Entry,
 	type Json,
+	type Member,
 	type MessageRef,
 	type MsgInput,
 	type NodeId,
@@ -24,8 +25,15 @@ export interface DeciderDeps {
 	judge: JudgeConfig;
 	/** Verified peers from the library's discovery records. */
 	listPeers(): Promise<Array<{ node_id: NodeId; base_url: string }>>;
-	listThreads(): Promise<Thread[]>;
+	/** Threads this node owns. `last_activity_at` is the host's own field on the thread row. */
+	listThreads(): Promise<Array<Thread & { last_activity_at?: string }>>;
 	listMessages(thread: ThreadRef, cursor?: string): Promise<{ items: Entry[] }>;
+	/** Whether this host could deliver a plan with that shape; what a `new` plan needs first. */
+	supports(plan: DeliveryPlan): Promise<boolean>;
+	/** The thread an already-ordered message lives in, read from this node's own records. */
+	locate(ref: MessageRef): Promise<ThreadRef | undefined>;
+	/** Members of one thread: landing needs the peer's membership, not a guess. */
+	describeThread(ref: ThreadRef): Promise<{ members: Member[] } | undefined>;
 	/** Contexts this node publishes for `execution: existing`; Carly is one session. */
 	receiverContexts(): Promise<Array<{ alias: string; summary: string; state: string }>>;
 }
@@ -76,6 +84,12 @@ export class CarlyDecider {
 	constructor(private readonly deps: DeciderDeps) {}
 
 	async decide(input: MsgInput): Promise<Action> {
+		const action = await this.#route(input);
+		return action.kind === "send" ? this.#land(action) : action;
+	}
+
+	/** The decision tree. It never picks a thread: that is `#land`'s deterministic job. */
+	async #route(input: MsgInput): Promise<Action> {
 		const meta = input.meta ?? {};
 		const explicit = this.#explicit(meta);
 		if (explicit !== undefined) return explicit;
@@ -93,6 +107,49 @@ export class CarlyDecider {
 		const id = text(resource, "id");
 		if (owner === undefined || id === undefined) throw new OnlyneError("invalid_request", "meta.resource needs owner and id.");
 		return { kind: "resource", resource: { owner, id }, operation, ...(meta.data === undefined ? {} : { data: meta.data }) };
+	}
+
+	/**
+	 * RFC 0016 §5: where a message lands is a fact this node's own records already answer, so it
+	 * is resolved here instead of asked. An explicit `meta.thread` wins; a reply lands in the
+	 * thread of the message it answers; anything else continues the most recently created open
+	 * thread that already holds the peer. `execution: new` is the only request for a new thread —
+	 * without it a send must not open one thread per message.
+	 */
+	async #land(action: Extract<Action, { kind: "send" }>): Promise<Action> {
+		if (action.thread !== undefined) return action;
+		if (action.execution === "new") {
+			// The thread would be opened before the delivery is attempted, so a plan this host
+			// must refuse would leave an empty conversation nobody joined. Ask first.
+			if (!(await this.deps.supports({ response: action.response, execution: action.execution }))) {
+				throw new OnlyneError("unsupported_delivery", "This host cannot deliver a `new` execution context, so it opened no thread.");
+			}
+			return action;
+		}
+		if (action.in_reply_to !== undefined) {
+			const located = await this.deps.locate(action.in_reply_to);
+			if (located !== undefined) return { ...action, thread: located };
+		}
+		const recent = await this.#recentThreadWith(action.to);
+		return recent === undefined ? action : { ...action, thread: recent };
+	}
+
+	/**
+	 * The most recently active open thread this node owns whose active members already include
+	 * `peer`. A row written before `last_activity_at` existed falls back to its creation time.
+	 */
+	async #recentThreadWith(peer: NodeId): Promise<ThreadRef | undefined> {
+		const candidates = (await this.deps.listThreads())
+			.filter(thread => thread.state === "open" && thread.thread_ref.owner === this.deps.nodeId)
+			.sort((left, right) => (right.last_activity_at ?? right.created_at).localeCompare(left.last_activity_at ?? left.created_at)
+				|| right.thread_ref.id.localeCompare(left.thread_ref.id));
+		for (const thread of candidates) {
+			const described = await this.deps.describeThread(thread.thread_ref);
+			if (described?.members.some(member => member.peer === peer && member.state === "active") === true) {
+				return thread.thread_ref;
+			}
+		}
+		return undefined;
 	}
 
 	/** Stable meta fields route without a judgment; everything semantic asks the model. */

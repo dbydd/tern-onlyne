@@ -1,12 +1,32 @@
 import {
 	type DeliveryPlan,
 	type Entry,
+	type Json,
 	type Message,
 	type NotifyEvent,
 	type Runtime,
+	type ThreadRef,
 	type TraceEvent,
 } from "@onlyne/lib";
 import type { CarlyDecider } from "./decider.ts";
+
+/**
+ * The handshake facts a trust delivery carries, so the host renders a trust item without
+ * re-reading the trust table and without asking the decider anything (RFC 0018 §3).
+ */
+export interface TrustPending {
+	node_id: string;
+	fingerprint: string;
+	phase: string;
+	policy: string;
+	rule: string;
+	conclusion: string;
+	/** True only for an entry that carries an executable approval or rejection. */
+	actionable: boolean;
+	declared?: string;
+	observed?: string;
+	rotation_from?: string;
+}
 
 export interface PendingInbound {
 	token: string;
@@ -24,6 +44,8 @@ export interface PendingInbound {
 	relation?: string;
 	/** The inbound judgment: does the sender wait for an answer? */
 	needs_answer?: boolean;
+	/** Set when this item is a handshake delivery rather than a peer message. */
+	trust?: TrustPending;
 }
 
 export interface BridgeDeps {
@@ -31,7 +53,35 @@ export interface BridgeDeps {
 	/** Confirm consumption once Carly has provably read the entry (she answered it). */
 	confirm(entry: Entry, context: string): Promise<void>;
 	observe?(url: string, source: string, expectedNode?: string): Promise<void>;
+	/** RFC 0018 §2–§3: the host's acquisition pipeline owns every trust transition. */
+	trust?(event: Extract<NotifyEvent, { event: "trust" }>): void;
+	/** One entry reached the runtime: the conversation it belongs to is the active one. */
+	touch?(thread: ThreadRef, at: string): Promise<void>;
 	log(message: string, fields?: Record<string, unknown>): void;
+}
+
+function trustPending(value: Json | undefined): TrustPending | undefined {
+	if (value === null || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const raw = "trust" in value ? value.trust : undefined;
+	if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return undefined;
+	const text = (key: string): string | undefined => {
+		const field = raw[key];
+		return typeof field === "string" && field !== "" ? field : undefined;
+	};
+	const node_id = text("node_id");
+	const fingerprint = text("fingerprint");
+	const phase = text("phase");
+	if (node_id === undefined || fingerprint === undefined || phase === undefined) return undefined;
+	return {
+		node_id, fingerprint, phase,
+		policy: text("policy") ?? "unknown",
+		rule: text("rule") ?? "",
+		conclusion: text("conclusion") ?? "status",
+		actionable: raw["actionable"] === true,
+		...(text("declared") === undefined ? {} : { declared: text("declared") }),
+		...(text("observed") === undefined ? {} : { observed: text("observed") }),
+		...(text("rotation_from") === undefined ? {} : { rotation_from: text("rotation_from") }),
+	};
 }
 
 /**
@@ -66,15 +116,22 @@ export class CarlyBridge implements Runtime {
 		if (existing !== undefined) {
 			item = existing.item;
 		} else {
+			// A handshake entry carries its own judgment: whether it owes an action is a fact
+			// about the trust row, not a question for the model (RFC 0018 §3).
+			const trust = trustPending(entry.message.meta?.data);
 			let needsAnswer: boolean | undefined;
-			try {
-				needsAnswer = (await this.deps.decider.decideInbound(entry, plan)).needsAnswer;
-			} catch (error) {
-				this.deps.log("onlyne.delivery.failed", {
-					entry: key,
-					error: error instanceof Error ? error.message : String(error),
-				});
-				throw error;
+			if (trust !== undefined) {
+				needsAnswer = trust.actionable;
+			} else {
+				try {
+					needsAnswer = (await this.deps.decider.decideInbound(entry, plan)).needsAnswer;
+				} catch (error) {
+					this.deps.log("onlyne.delivery.failed", {
+						entry: key,
+						error: error instanceof Error ? error.message : String(error),
+					});
+					throw error;
+				}
 			}
 			item = {
 				token: `onlyne-${crypto.randomUUID()}`,
@@ -94,11 +151,13 @@ export class CarlyBridge implements Runtime {
 				targets: (entry.message.meta?.mentions ?? []).filter((value): value is string => typeof value === "string"),
 				...(entry.message.meta?.relation === undefined ? {} : { relation: entry.message.meta.relation }),
 				...(needsAnswer === undefined ? {} : { needs_answer: needsAnswer }),
+				...(trust === undefined ? {} : { trust }),
 			};
 			this.#pending.set(key, { entry, item });
 			this.#byRef.set(`${entry.message.sender}/${entry.message.id}`, entry);
 			this.deps.log("onlyne.delivery.queued", { entry: key, sender: item.sender });
 		}
+		await this.deps.touch?.(entry.thread_ref, entry.at);
 		const consumed = plan?.response === "none" || item.needs_answer === false;
 		return { context: "carly", consumed, outcome: "queued" };
 	}
@@ -109,9 +168,9 @@ export class CarlyBridge implements Runtime {
 				event: "trust", cause: event.cause, phase: event.phase,
 				node: event.entry.node_id, fingerprint: event.entry.fingerprint,
 			});
-			if (event.entry.base_url) {
-				void this.deps.observe?.(event.entry.base_url, "trust-statement", event.entry.node_id);
-			}
+			// The pipeline decides what happens next, including whether that address may be
+			// dialed at all: probing it before the policy runs is the hole RFC 0018 §2.2 closes.
+			this.deps.trust?.(event);
 			return;
 		}
 		if (event.event === "inbound") {
@@ -141,6 +200,23 @@ export class CarlyBridge implements Runtime {
 		}
 		if (this.#settled.has(token)) return { consumed: false, reason: "already_consumed" };
 		return { consumed: false, reason: "unknown_token" };
+	}
+
+	/**
+	 * A decided peer no longer owes a decision: every actionable handshake item for it is
+	 * settled, so the todo disappears once the agent or the panel has acted (RFC 0018 §6).
+	 */
+	async settleTrust(nodeId: string): Promise<number> {
+		let settled = 0;
+		for (const [key, value] of [...this.#pending]) {
+			if (value.item.trust?.node_id !== nodeId || !value.item.trust.actionable) continue;
+			this.#pending.delete(key);
+			this.#settle(value.item.token, "token");
+			await this.deps.confirm(value.entry, "carly");
+			this.deps.log("onlyne.trust.settled", { node: nodeId, token: value.item.token });
+			settled++;
+		}
+		return settled;
 	}
 
 	#settle(token: string, via: "reply" | "token"): void {

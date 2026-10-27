@@ -1,18 +1,29 @@
+import { AsyncLocalStorage } from "node:async_hooks";
+import { lookup } from "node:dns/promises";
+import { appendFileSync } from "node:fs";
 import { appendFile, chmod, mkdir, readFile, rename, stat, unlink, writeFile } from "node:fs/promises";
+import { networkInterfaces } from "node:os";
 import { join } from "node:path";
+import type { Server } from "bun";
 import {
 	OnlyneError,
 	generateKeyMaterial,
 	trustPhase,
+	type DeliveryPlan,
+	type Entry,
 	type KeyHook,
 	type KeyMaterial,
 	type MsgInput,
 	type OnlyneNode,
+	type Outbound,
 	type Thread,
-	type TrustEntry,
+	type ThreadRef,
+	type TrustSeed,
 } from "@onlyne/lib";
+import { AcquisitionStore, readAcquisition, readSeeds, type AcquisitionPolicy } from "./acquisition.ts";
 import { CarlyBridge } from "./bridge.ts";
 import { CarlyDecider } from "./decider.ts";
+import { TrustPipeline, trustRow, type Outcome } from "./handshake.ts";
 import { configPath } from "./paths.ts";
 import type { JudgeConfig } from "./systemone.ts";
 import { advertisedHost, createOnlyneNode } from "./vendor/omp-host/node.ts";
@@ -53,6 +64,202 @@ function log(message: string, fields: Record<string, unknown> = {}): void {
 	void appendFile(logPath, line).catch(() => undefined);
 }
 
+/** A configuration this host refuses to run with leaves one line behind before the process ends. */
+function failStartup(message: string): never {
+	const line = `${JSON.stringify({ at: new Date().toISOString(), message: "onlyne.config.rejected", detail: message })}\n`;
+	try {
+		appendFileSync(logPath, line);
+	} catch {
+		// The stderr line carries the same text; a failed write must not mask the reason.
+	}
+	console.error(JSON.stringify({ message: "onlyne.config.rejected", detail: message }));
+	process.exit(1);
+}
+
+/**
+ * Thread reuse orders candidates by which conversation was touched last, and the library's row
+ * carries no such timestamp. The host adds one to the row it already owns — the library reads
+ * and writes that row as JSON and spreads unknown fields, so the field survives its updates.
+ * A row from before this field exists has none, and the reader falls back to `created_at`.
+ */
+async function touchThread(thread: ThreadRef, at: string): Promise<void> {
+	await storage.transaction(async tx => {
+		const slot = `thread/${encodeURIComponent(thread.owner)}/${encodeURIComponent(thread.id)}`;
+		const row = await tx.get<Thread & { last_activity_at?: string }>(slot);
+		if (row === undefined) return;
+		await tx.put(slot, { ...row, last_activity_at: at });
+	});
+}
+
+/** The thread a send landed in, when its outcome carries a receipt. */
+function receiptThread(outcome: unknown): ThreadRef | undefined {
+	if (outcome === null || typeof outcome !== "object" || !("receipt" in outcome)) return undefined;
+	const receipt = outcome.receipt;
+	if (receipt === null || typeof receipt !== "object" || !("thread_ref" in receipt)) return undefined;
+	const ref = receipt.thread_ref;
+	if (ref === null || typeof ref !== "object" || !("owner" in ref) || !("id" in ref)) return undefined;
+	if (typeof ref.owner !== "string" || typeof ref.id !== "string") return undefined;
+	return { owner: ref.owner, id: ref.id };
+}
+
+/** One row of `threads()`: the library's thread plus the host's activity stamp. */
+interface ThreadSummary {
+	id: string;
+	title: string;
+	members: Array<{ node_id: string; state: string }>;
+	last_seq: string;
+	last_activity_at: string;
+	open: boolean;
+}
+
+/** Every thread this node owns. The library pages them at 100 rows; reads take the whole list. */
+async function ownThreads(): Promise<Array<Thread & { last_activity_at?: string }>> {
+	const items: Array<Thread & { last_activity_at?: string }> = [];
+	let cursor: string | undefined;
+	do {
+		const page = await node.threads.list(node.auth, { page_size: 100, ...(cursor === undefined ? {} : { cursor }) });
+		items.push(...page.items);
+		cursor = page.next_cursor ?? undefined;
+	} while (cursor !== undefined);
+	return items;
+}
+
+/**
+ * `threads()`: ordered the way landing orders its candidates — last activity first, id as the
+ * tie-break — so the top row is the thread the next send to the same peer would reuse.
+ */
+async function threadSummaries(): Promise<ThreadSummary[]> {
+	const summaries = await Promise.all((await ownThreads()).map(async thread => {
+		const described = await node.threads.describe(node.auth, thread.thread_ref).catch(() => undefined);
+		return {
+			id: thread.thread_ref.id,
+			title: thread.title,
+			members: (described?.members ?? []).map(member => ({ node_id: member.peer, state: member.state })),
+			last_seq: (BigInt(thread.next_seq) - 1n).toString(),
+			last_activity_at: thread.last_activity_at ?? thread.created_at,
+			open: thread.state === "open",
+		};
+	}));
+	return summaries.sort((left, right) => right.last_activity_at.localeCompare(left.last_activity_at)
+		|| right.id.localeCompare(left.id));
+}
+
+/**
+ * A thread named by the caller: a bare id or title among this node's own threads, an
+ * `owner/id` pair, or `{owner, id}`. A bare string that matches nothing is read as this
+ * node's own thread id, so a fresh id answers with an empty list instead of an error.
+ */
+async function resolveThread(input: unknown): Promise<ThreadRef> {
+	if (typeof input === "string" && input !== "") {
+		const matches = (await ownThreads()).filter(thread => thread.thread_ref.id === input || thread.title === input);
+		if (matches.length > 1) throw new OnlyneError("invalid_request", `多个 thread 匹配「${input}」，请用 owner/id 指定`);
+		const only = matches[0];
+		if (only !== undefined) return only.thread_ref;
+		const slash = input.indexOf("/");
+		if (slash > 0) return { owner: input.slice(0, slash), id: input.slice(slash + 1) };
+		return { owner: config.node.id, id: input };
+	}
+	if (input !== null && typeof input === "object") {
+		const ref = input as { owner?: unknown; id?: unknown };
+		if (typeof ref.id === "string" && ref.id !== "") {
+			return { owner: typeof ref.owner === "string" && ref.owner !== "" ? ref.owner : config.node.id, id: ref.id };
+		}
+	}
+	throw new OnlyneError("invalid_request", "thread 需要一个 thread id、owner/id 或 {owner, id}");
+}
+
+/** The fields a reader needs to place one entry and to quote it. */
+function entryView(entry: Entry, plan: DeliveryPlan | undefined) {
+	return {
+		thread: entry.thread_ref,
+		seq: entry.seq,
+		id: entry.message.id,
+		sender: entry.message.sender,
+		text: entry.message.msg,
+		at: entry.at,
+		plan: plan ?? null,
+		relation: entry.message.meta?.relation ?? null,
+		in_reply_to: entry.message.meta?.in_reply_to ?? null,
+	};
+}
+
+/**
+ * The delivery plan each entry was sent with, by seq. Neither the entry nor the thread row
+ * carries it: the recipient keeps it on the attention row, and the local inbox row survives
+ * consumption (only `injected` and `acked` change), so `messages.inbox` still has it. What this
+ * node sent is on the outbound record's receipt — `outbound/` is the library's own slot prefix
+ * (`client.ts:135`), read here and never written.
+ */
+async function planIndex(ref: ThreadRef): Promise<Map<string, DeliveryPlan>> {
+	const plans = new Map<string, DeliveryPlan>();
+	let cursor: string | undefined;
+	do {
+		const page = await node.messages.inbox(node.auth, { page_size: 100, ...(cursor === undefined ? {} : { cursor }) });
+		for (const row of page.items) {
+			const { attention } = row;
+			if (attention.plan === undefined) continue;
+			if (attention.thread_ref.owner !== ref.owner || attention.thread_ref.id !== ref.id) continue;
+			plans.set(attention.seq, attention.plan);
+		}
+		cursor = page.next_cursor ?? undefined;
+	} while (cursor !== undefined);
+	for (const { value } of await storage.transaction(tx => tx.scan<Outbound>("outbound/"))) {
+		const receipt = value.receipt;
+		if (receipt === undefined) continue;
+		if (receipt.thread_ref.owner !== ref.owner || receipt.thread_ref.id !== ref.id) continue;
+		plans.set(receipt.seq, receipt.plan);
+	}
+	return plans;
+}
+
+/** `read()`: entries of one thread, oldest first, with `since_seq` exclusive. */
+async function readThread(ref: ThreadRef, since: string | undefined, limit: number) {
+	const page = await node.messages.list(node.auth, ref, {
+		attention: "thread",
+		page_size: limit,
+		...(since === undefined ? {} : { since_seq: since }),
+	});
+	const plans = await planIndex(ref);
+	return {
+		items: page.items.map(entry => entryView(entry, plans.get(entry.seq))),
+		next_cursor: page.next_cursor ?? null,
+	};
+}
+
+/** `message()`: one entry by position in a thread, or by the sender's message id. */
+async function messageView(input: unknown) {
+	if (input === null || typeof input !== "object") throw new OnlyneError("invalid_request", "ref 需要 {thread, seq} 或 {sender, id}");
+	const ref = input as { thread?: unknown; seq?: unknown; sender?: unknown; id?: unknown };
+	if (typeof ref.sender === "string" && ref.sender !== "" && typeof ref.id === "string" && ref.id !== "") {
+		const entry = await node.messages.getByRef(node.auth, { sender: ref.sender, id: ref.id }).catch(() => undefined);
+		if (entry !== undefined) return entryView(entry, (await planIndex(entry.thread_ref)).get(entry.seq));
+		// A message this node sent into a peer-owned thread is not stored as an entry here;
+		// the conversation log still holds its body, but not the plan it was sent with.
+		const row = await node.history.message(node.auth, { sender: ref.sender, id: ref.id });
+		return {
+			thread: row.thread_ref ?? null,
+			seq: row.seq ?? null,
+			id: row.message.id,
+			sender: row.message.sender,
+			text: row.message.msg,
+			at: row.at,
+			plan: null,
+			relation: row.message.meta?.relation ?? null,
+			in_reply_to: row.message.meta?.in_reply_to ?? null,
+		};
+	}
+	if (ref.thread !== undefined && typeof ref.seq === "string" && /^\d+$/.test(ref.seq)) {
+		const thread = await resolveThread(ref.thread);
+		const before = BigInt(ref.seq) - 1n;
+		if (before < 0n) throw new OnlyneError("not_found", `thread ${thread.id} 里没有 seq ${ref.seq}`);
+		const page = await node.messages.list(node.auth, thread, { attention: "thread", page_size: 1, since_seq: before.toString() });
+		const entry = page.items.find(item => item.seq === ref.seq);
+		if (entry === undefined) throw new OnlyneError("not_found", `thread ${thread.id} 里没有 seq ${ref.seq}`);
+		return entryView(entry, (await planIndex(thread)).get(entry.seq));
+	}
+	throw new OnlyneError("invalid_request", "ref 需要 {thread, seq} 或 {sender, id}");
+}
+
 await startLog();
 
 interface StoredSettings {
@@ -62,6 +269,8 @@ interface StoredSettings {
 	public_url?: string;
 	key_scope?: "project" | "none";
 	systemone?: Partial<JudgeConfig>;
+	acquisition?: unknown;
+	trust?: unknown;
 }
 
 async function readSettings(): Promise<StoredSettings> {
@@ -75,17 +284,19 @@ async function readSettings(): Promise<StoredSettings> {
 	}
 }
 
-function toConfig(stored: StoredSettings): OnlyneConfig {
+function toConfig(stored: StoredSettings, seeds: TrustSeed[]): OnlyneConfig {
 	if (stored.node_id === undefined || stored.region === undefined) {
 		throw new OnlyneError("unsupported_delivery", "Onlyne is not configured yet; open the Onlyne settings block in Tern.");
 	}
 	const keyed = stored.key_scope !== "none";
+	const publicUrl = stored.public_url?.trim();
 	return {
 		path: configPath(dataDir),
 		region: stored.region,
 		node: { id: stored.node_id, ...(keyed ? { key_ref: "plugin-data:node-key.json" } : { key_scope: "none" as const }) },
-		server: { bind: stored.bind ?? "127.0.0.1", ...(stored.public_url === undefined || stored.public_url === "" ? {} : { public_url: stored.public_url }) },
+		server: { bind: stored.bind ?? "127.0.0.1", ...(publicUrl === undefined || publicUrl === "" ? {} : { public_url: publicUrl }) },
 		threads: { page_size: 50 },
+		...(seeds.length === 0 ? {} : { trust: seeds }),
 	};
 }
 
@@ -148,12 +359,59 @@ const keys: KeyHook = Object.assign(
 );
 
 const stored = await readSettings();
-const config = toConfig(stored);
+let config: OnlyneConfig;
+let acquisition: AcquisitionPolicy;
+let seeds: TrustSeed[];
+try {
+	// The policy and the seeds are read before anything binds: a malformed or retired key is a
+	// startup error, not a value to guess at (RFC 0018 §2, §5).
+	acquisition = readAcquisition(stored);
+	seeds = readSeeds(stored);
+	config = toConfig(stored, seeds);
+} catch (error) {
+	failStartup(error instanceof Error ? error.message : String(error));
+}
 const keyed = stored.key_scope !== "none";
 const storage = new SqliteStorage(join(dataDir, "onlyne.db"));
 const contexts = new ContextRegistry(storage, config.node.id, "carly");
+const acquisitionStore = new AcquisitionStore(storage);
+/**
+ * The arrival address of the request being served. The library emits its `trust` notification
+ * synchronously inside `receive()`, so this context is still the one in force when the host
+ * records where the statement came from (RFC 0018 §2.1).
+ */
+const inbound = new AsyncLocalStorage<{ address: string; port: number; seen: boolean }>();
+
+log("onlyne.acquisition.policy", { policy: acquisition.policy, allow: acquisition.allow, allow_loopback: false });
+for (const seed of seeds) {
+	log("onlyne.acquisition.seed", { node: seed.node_id, fingerprint: seed.fingerprint, source: kvPath });
+	await acquisitionStore.audit({
+		at: new Date().toISOString(), kind: "seed", actor: "seed",
+		node_id: seed.node_id, fingerprint: seed.fingerprint,
+		policy: acquisition.policy, allow: [...acquisition.allow],
+		rule: "trust_seeds 是人类的预授权，不受获取策略约束",
+		conclusion: "seed_authorized", detail: `来源文件 ${kvPath}`, overridden: true,
+	});
+}
 
 let node!: OnlyneNode;
+let pipeline: TrustPipeline | undefined;
+/** The panel is the last gate: only its own code sets this header, never an agent export. */
+function caller(request: Request): "human" | "agent" {
+	return request.headers.get("x-onlyne-human") === "1" ? "human" : "agent";
+}
+
+function denial(outcome: Extract<Outcome<never>, { ok: false }>): Record<string, unknown> {
+	return {
+		code: "policy_denied",
+		message: `获取策略拒绝了这个动作：${outcome.rule}`,
+		retryable: false,
+		details: {
+			policy: acquisition.policy, allow: acquisition.allow,
+			reason: outcome.verdict.reason, address: outcome.verdict.address ?? null, rule: outcome.rule,
+		},
+	};
+}
 const decider = new CarlyDecider({
 	nodeId: config.node.id,
 	judge: judgeConfig(stored),
@@ -181,17 +439,20 @@ const decider = new CarlyDecider({
 		}
 		return [...peers.entries()].map(([node_id, base_url]) => ({ node_id, base_url }));
 	},
-	listThreads: async () => {
-		const threads: Thread[] = [];
-		let cursor: string | undefined;
-		do {
-			const page = await node.threads.list(node.auth, { page_size: 100, cursor });
-			threads.push(...page.items);
-			cursor = page.next_cursor ?? undefined;
-		} while (cursor !== undefined);
-		return threads;
-	},
+	listThreads: () => ownThreads(),
 	listMessages: (thread, cursor) => node.messages.list(node.auth, thread, { attention: "thread", page_size: 100, cursor }),
+	supports: plan => bridge.supports(plan),
+	locate: async ref => {
+		const entry = await node.messages.getByRef(node.auth, ref).catch(() => undefined);
+		if (entry !== undefined) return entry.thread_ref;
+		// A message this node sent has no entry of its own; its receipt names the thread.
+		const message = await node.history.message(node.auth, ref).catch(() => undefined);
+		return message?.thread_ref;
+	},
+	describeThread: async ref => {
+		const described = await node.threads.describe(node.auth, ref).catch(() => undefined);
+		return described === undefined ? undefined : { members: described.members };
+	},
 	receiverContexts: async () => [{ alias: "carly", summary: "Carly's Tern conversation", state: "idle" }],
 });
 
@@ -200,19 +461,67 @@ const bridge = new CarlyBridge({
 	confirm: async (entry, context) => {
 		await node.client.confirmConsumption(entry, context, "fragment");
 	},
-	observe: async (url, source, expectedNode) => {
-		await node.discovery.observe(url, source, expectedNode).catch(() => undefined);
-	},
+	trust: event => pipeline?.notify(event),
+	touch: touchThread,
 	log,
 });
 
 let endpoint = "";
-const server = Bun.serve({
+// The fetch handler reads the arrival address off this server, so the binding has to be
+// annotated: a `const` that references itself would have no inferred type at all.
+/** The port a configured `public_url` names; a URL without one names its scheme's default. */
+function publicPort(url: string): number {
+	const parsed = new URL(url);
+	if (parsed.port !== "") return Number(parsed.port);
+	return parsed.protocol === "https:" ? 443 : 80;
+}
+
+/**
+ * Whether this machine can answer on that host at all. A loopback name, a literal of one of
+ * this machine's own addresses, or a name that resolves to either, is a local bind; everything
+ * else is a reverse proxy's declaration, and its port belongs to the proxy.
+ */
+async function locallyBindable(host: string): Promise<boolean> {
+	const literal = host.replace(/^\[|\]$/g, "");
+	if (literal === "::1" || literal === "::" || literal === "0.0.0.0" || literal.startsWith("127.")) return true;
+	const mine = new Set<string>();
+	for (const addresses of Object.values(networkInterfaces())) {
+		for (const address of addresses ?? []) mine.add(address.address);
+	}
+	if (mine.has(literal)) return true;
+	const resolved = await lookup(literal, { all: true }).catch(() => []);
+	return resolved.some(row => row.address === "::1" || row.address.startsWith("127.") || mine.has(row.address));
+}
+
+let server!: Server<undefined>;
+const publicUrl = config.server.public_url;
+let wanted = 0;
+let proxied = false;
+if (publicUrl !== undefined) {
+	let parsed: URL;
+	try {
+		parsed = new URL(publicUrl);
+	} catch {
+		failStartup(`onlyne.config.public_url is not an absolute URL: ${publicUrl}`);
+	}
+	if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+		failStartup(`onlyne.config.public_url must be http or https, got ${parsed.protocol}`);
+	}
+	// The host decides first: a proxy host would otherwise send this process looking for 443.
+	if (await locallyBindable(parsed.hostname)) wanted = publicPort(publicUrl);
+	else proxied = true;
+}
+
+const listening = (port: number) => Bun.serve({
 	hostname: config.server.bind,
-	port: 0,
+	port,
 	async fetch(request) {
 		const url = new URL(request.url);
-		if (url.pathname.startsWith("/onlyne/")) return node.fetch(request);
+		if (url.pathname.startsWith("/onlyne/")) {
+			const ip = server.requestIP(request);
+			if (ip === null || ip === undefined) return node.fetch(request);
+			return inbound.run({ address: ip.address, port: ip.port, seen: false }, () => node.fetch(request));
+		}
 		if (!url.pathname.startsWith("/admin/")) return new Response("Not found", { status: 404 });
 		if (request.headers.get("x-onlyne-admin-token") !== adminToken) return json({ error: "unauthorized" }, 401);
 		try {
@@ -234,8 +543,9 @@ const server = Bun.serve({
 				return json({ items: records.filter(r => r.node_id !== config.node.id) });
 			}
 			if (url.pathname === "/admin/discovery/refresh" && request.method === "POST") {
-				await node.discovery.refresh();
-				return json({ ok: true });
+				const outcome = await pipeline!.refresh(caller(request));
+				if (!outcome.ok) return json({ error: denial(outcome) }, 403);
+				return json({ ok: true, records: outcome.value.records });
 			}
 			if (url.pathname === "/admin/pending") return json({ items: bridge.pending() });
 			if (url.pathname === "/admin/consumed" && request.method === "POST") {
@@ -246,32 +556,63 @@ const server = Bun.serve({
 			if (url.pathname === "/admin/contact" && request.method === "POST") {
 				const body = await request.json() as { endpoint?: unknown };
 				if (typeof body.endpoint !== "string") return json({ error: "endpoint required" }, 400);
-				await node.discovery.observe(body.endpoint, "manual");
+				const outcome = await pipeline!.contact(body.endpoint, caller(request));
+				if (!outcome.ok) return json({ error: denial(outcome) }, 403);
 				return json({ ok: true });
 			}
+			if (url.pathname === "/admin/acquisition") return json(await pipeline!.panel());
 			if (url.pathname === "/admin/trust/list") {
 				const rows = await node.trust.list(node.auth);
-				return json({ items: rows.map(trustRow) });
+				const observed = new Map((await acquisitionStore.observations())
+					.map(row => [`${row.node_id}\u0000${row.fingerprint}`, row]));
+				return json({ items: rows.map(row => trustRow(row, observed.get(`${row.node_id}\u0000${row.fingerprint}`))) });
 			}
 			if (url.pathname === "/admin/trust/begin" && request.method === "POST") {
 				const body = await request.json() as { node_id?: unknown };
 				if (typeof body.node_id !== "string" || body.node_id === "") return json({ error: "node_id required" }, 400);
-				const identity = await node.trust.inspect(body.node_id);
-				return json({ node_id: identity.node_id, fingerprint: identity.fingerprint, public_key: identity.public_key });
+				const outcome = await pipeline!.begin(body.node_id, caller(request));
+				if (!outcome.ok) return json({ error: denial(outcome) }, 403);
+				return json({ node_id: outcome.value.node_id, fingerprint: outcome.value.fingerprint, public_key: outcome.value.public_key });
 			}
 			if (url.pathname === "/admin/trust/accept" && request.method === "POST") {
 				const body = await request.json() as { node_id?: unknown; fingerprint?: unknown };
 				if (typeof body.node_id !== "string" || body.node_id === "" || typeof body.fingerprint !== "string" || body.fingerprint === "") {
 					return json({ error: "node_id and fingerprint required" }, 400);
 				}
-				const entry = await node.trust.accept(node.auth, body.node_id, body.fingerprint);
-				return json({ ok: true, entry: trustRow(entry) });
+				const outcome = await pipeline!.approve(body.node_id, body.fingerprint, caller(request));
+				if (!outcome.ok) return json({ error: denial(outcome) }, 403);
+				return json({ ok: true, entry: trustRow(outcome.value) });
 			}
 			if (url.pathname === "/admin/trust/revoke" && request.method === "POST") {
 				const body = await request.json() as { node_id?: unknown };
 				if (typeof body.node_id !== "string" || body.node_id === "") return json({ error: "node_id required" }, 400);
-				await node.trust.revoke(node.auth, body.node_id);
+				await pipeline!.revoke(body.node_id, caller(request));
 				return json({ ok: true });
+			}
+			if (url.pathname === "/admin/trust/rotate" && request.method === "POST") {
+				// The key swap itself is neither inbound nor outbound acquisition, so no policy
+				// judgement applies; the statements it owes the peers are what reach them.
+				const identity = await node.trust.rotate(node.auth);
+				await acquisitionStore.audit({
+					at: new Date().toISOString(), kind: "action", actor: caller(request),
+					fingerprint: identity.fingerprint,
+					policy: acquisition.policy, allow: [...acquisition.allow],
+					rule: "本节点密钥轮换", conclusion: "rotated",
+				});
+				return json({ ok: true, fingerprint: identity.fingerprint, public_key: identity.public_key });
+			}
+			// Reads: no decision, no policy, no judge. They answer what this node already stores.
+			if (url.pathname === "/admin/threads") return json({ items: await threadSummaries() });
+			if (url.pathname === "/admin/read" && request.method === "POST") {
+				const body = await request.json() as { thread?: unknown; since_seq?: unknown; limit?: unknown };
+				const thread = await resolveThread(body.thread);
+				const since = typeof body.since_seq === "string" && /^\d+$/.test(body.since_seq) ? body.since_seq : undefined;
+				const limit = typeof body.limit === "number" && body.limit > 0 ? Math.min(Math.floor(body.limit), 200) : 100;
+				return json(await readThread(thread, since, limit));
+			}
+			if (url.pathname === "/admin/message" && request.method === "POST") {
+				const body = await request.json() as { ref?: unknown };
+				return json({ message: await messageView(body.ref) });
 			}
 			if (url.pathname === "/admin/msg" && request.method === "POST") {
 				const body = await request.json() as MsgInput;
@@ -279,6 +620,8 @@ const server = Bun.serve({
 				const outcome = await node.client.msg(body);
 				// Consumption follows a send the peer accepted, never one that failed on the way.
 				await bridge.observeOutbound({ meta: body.meta });
+				const landed = receiptThread(outcome);
+				if (landed !== undefined) await touchThread(landed, new Date().toISOString());
 				return json({ ok: true, outcome });
 			}
 			return json({ error: "not found" }, 404);
@@ -289,8 +632,33 @@ const server = Bun.serve({
 	},
 });
 
+// A configured port keeps the address stable across restarts; a taken port falls back to an
+// ephemeral one rather than leaving the node unbound, and says so in the log.
+try {
+	server = listening(wanted);
+} catch (error) {
+	if (wanted === 0) throw error;
+	log("onlyne.port.unavailable", { port: wanted, error: error instanceof Error ? error.message : String(error) });
+	server = listening(0);
+}
+
 const host = advertisedHost(config.server.bind);
-endpoint = `http://${host.includes(":") ? `[${host}]` : host}:${server.port}/onlyne/v3`;
+// A peer stores whatever address the introduction carried, so the endpoint must name the port
+// this process actually bound: a `public_url` whose port was taken would otherwise be a lie.
+const bound = `http://${host.includes(":") ? `[${host}]` : host}:${server.port}/onlyne/v3`;
+if (publicUrl !== undefined && (proxied || wanted === server.port)) {
+	// A proxy declaration is published verbatim: rewriting it to the local bind would hand peers
+	// an address only this machine can reach.
+	endpoint = publicUrl;
+	if (proxied) {
+		log("onlyne.server.proxy", {
+			public_url: publicUrl, local_port: server.port,
+			detail: "public_url 是代理声明，本进程不监听该端口",
+		});
+	}
+} else {
+	endpoint = bound;
+}
 await contexts.ensureMain();
 node = createOnlyneNode({
 	config, endpoint, instanceId: crypto.randomUUID(), storage, contexts, runtime: bridge,
@@ -301,6 +669,28 @@ node = createOnlyneNode({
 	},
 	decide: input => decider.decide(input),
 });
+pipeline = new TrustPipeline({
+	node: () => node,
+	nodeId: config.node.id,
+	policy: () => acquisition,
+	store: acquisitionStore,
+	contextAlias: () => "carly",
+	origin: () => {
+		const store = inbound.getStore();
+		// One arrival per request: the first notification is the inbound statement; anything
+		// later in the same call stack (an auto-approval's own reply) is not a new arrival.
+		if (store === undefined || store.seen) return undefined;
+		store.seen = true;
+		return { address: store.address, port: store.port };
+	},
+	seeds: () => seeds,
+	seedSource: () => kvPath,
+	allowLoopback: () => false,
+	settle: async nodeId => {
+		await bridge.settleTrust(nodeId);
+	},
+	log,
+});
 node.client.runMaintenance();
 await writeFile(serverPath, JSON.stringify({ port: server.port, endpoint, pid: process.pid, token: adminToken }), { mode: 0o600 });
 log("onlyne.companion.ready", { endpoint, node: config.node.id, region: config.region, keyed });
@@ -308,20 +698,6 @@ console.error(JSON.stringify({ message: "onlyne.companion.ready", endpoint, node
 
 function json(value: unknown, status = 200): Response {
 	return new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json" } });
-}
-
-function trustRow(entry: TrustEntry): Record<string, unknown> {
-	return {
-		node_id: entry.node_id,
-		fingerprint: entry.fingerprint,
-		public_key: entry.public_key,
-		base_url: entry.base_url,
-		phase: trustPhase(entry),
-		local_approved: entry.local_approved,
-		remote_approved: entry.remote_approved,
-		first_seen: entry.first_seen,
-		last_checked: entry.last_checked,
-	};
 }
 
 let stopping = false;
