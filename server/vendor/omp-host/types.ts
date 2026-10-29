@@ -1,5 +1,7 @@
+// vendored from packages/omp-onlyne/src/types.ts@0e9ea39 (2026-10-29)
 import type { MessageRef, NodeId, ThreadRef, TrustPhase, TrustSeed } from "@onlyne/lib";
 import type { Locale } from "@onlyne/node-host/i18n";
+import type { AcquisitionPolicy } from "./acquire.ts";
 
 /**
  * Project-scoped configuration in `<project>/.onlyne/config.toml`.
@@ -20,6 +22,12 @@ export interface OnlyneConfig {
 	};
 	server: {
 		bind: string;
+		/**
+		 * The port this node answers on. Absent asks the operating system for one, and the
+		 * chosen port is written back here: a node whose address changes on every start
+		 * leaves every peer that recorded it calling a port nobody serves.
+		 */
+		port?: number;
 		/** The externally reachable base URL when a reverse proxy fronts the node. */
 		public_url?: string;
 	};
@@ -32,6 +40,8 @@ export interface OnlyneConfig {
 	};
 	/** Pinned peer fingerprints; an arriving key that matches is trusted without a prompt. */
 	trust?: TrustSeed[];
+	/** RFC 0018 §2: peers this node may approve without a human confirming first. */
+	acquisition?: AcquisitionPolicy;
 }
 
 /** One execution context the plugin registered for a delivered message. */
@@ -79,6 +89,11 @@ export interface ViewerThread {
 	unread: number;
 	last_seq: string;
 	messages: ViewerMessage[];
+	/**
+	 * A thread another node hosts: this node was invited into it, so the viewer can show it and
+	 * cannot offer the writes that belong to its owner.
+	 */
+	read_only?: boolean;
 }
 
 /** One discovery record row the viewer lists as an automatic-discovery candidate. */

@@ -1,3 +1,4 @@
+// vendored from packages/omp-onlyne/src/node.ts@0e9ea39 (2026-10-29)
 import { networkInterfaces } from "node:os";
 import { FetchTransport, OnlyneError, OnlyneNode, trustPhase, type Action, type AdmissionContext, type Auth, type Json, type KeyHook, type KeyMaterial, type MaintenanceClock, type MsgInput, type Runtime, type SigningTransportOptions, type Storage, type Target } from "@onlyne/lib";
 import { loadOrCreateKey, writeKeyMaterial } from "@onlyne/node-host/keys";
@@ -105,7 +106,7 @@ export function createOnlyneNode(deps: NodeDeps): OnlyneNode {
 			mayAdmit: async (actor, _thread, context) => keys === undefined || await admitted(actor, context),
 			inboundThread: async (actor, context) => keys === undefined || await admitted(actor, context),
 			// A context that cannot answer is not a continuation target: publishing one lets a
-			// sender aim a message at a session that can never reply.
+			// sender aim a message at a session that can never reply (caerulea report 4, problem 7).
 			executionContexts: async () => (await deps.contexts.list()).filter(canAnswer)
 				.map(record => ({ alias: record.alias, summary: record.summary, state: record.state })) as Json,
 			mention: async alias => {

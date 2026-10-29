@@ -192,6 +192,8 @@ Carly 通过 `plugins["onlyne"]` 调用。
 bun install
 bun run check     # 对 server/ 跑 tsc --noEmit
 bun run build     # 打包 dist/companion.js
+bun run check:vendor   # 报告与 packages/omp-onlyne/src 的漂移
+bun scripts/judge-samples.ts   # 对 System One 端点跑真 judge 样例
 tern plugin types .   # 重新生成 tern.d.luau，供 luau-lsp 使用
 ```
 
@@ -199,9 +201,11 @@ tern plugin types .   # 重新生成 tern.d.luau，供 luau-lsp 使用
 
 ## 内联的主机接线
 
-`server/vendor/omp-host/` 存放五个从 Onlyne 仓库 `packages/omp-onlyne/src/` 复制的文件：`node.ts`、`store.ts`、`types.ts`、`host-text.ts`、`bridge-text.ts`。它们负责为宿主构建协议节点，并实现 SQLite 存储与上下文注册表。
+`server/vendor/omp-host/` 存放六个从 Onlyne 仓库 `packages/omp-onlyne/src/` 复制的文件：`node.ts`、`store.ts`、`types.ts`、`host-text.ts`、`bridge-text.ts`、`acquire.ts`。它们负责为宿主构建协议节点，实现 SQLite 存储与上下文注册表，并带上配置类型所引用的获取策略。
 
-有了这份副本，本仓库只依赖已发布的 `@onlyne/lib` 与 `@onlyne/node-host` 就能构建。上游这五个文件有改动时要同步到这里，这边有改动时也要同步回去。
+有了这份副本，本仓库只依赖已发布的 `@onlyne/lib` 与 `@onlyne/node-host` 就能构建。上游这六个文件有改动时要同步到这里，这边有改动时也要同步回去。
+
+每个 vendored 文件第一行是 `// vendored from packages/omp-onlyne/src/<文件名>@<提交> (<日期>)`，记录复制时对应的 monorepo 提交。`bun run check:vendor` 会把这六个文件与上游逐一对比，对比前先去掉注释，所以首行注记和上游的引注注释不计入差异；每个文件输出一行：`same`，或 `drifted` 加 `+N`（上游多出的行）与 `-N`（本仓多出的行）。脚本只做报告，默认始终退出码 0；加 `--strict` 时有漂移就以退出码 1 结束。运行前提是 `packages/omp-onlyne/src/` 与 `external-integrations/` 同级，也就是在 Onlyne 主仓的检出里跑。
 
 `server/paths.ts` 保留插件仍然需要的一个路径约定，来源是 `packages/omp-onlyne/src/config.ts`。
 

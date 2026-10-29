@@ -5,8 +5,8 @@
     "": {
       "name": "tern-onlyne",
       "dependencies": {
-        "@onlyne/lib": "^3.0.0",
-        "@onlyne/node-host": "^3.0.0",
+        "@onlyne/lib": "^3.1.0",
+        "@onlyne/node-host": "^3.1.0",
       },
       "devDependencies": {
         "@types/bun": "^1.4.4",
@@ -17,9 +17,9 @@
   "packages": {
     "@leichtgewicht/ip-codec": ["@leichtgewicht/ip-codec@2.0.5", "", {}, "sha512-Vo+PSpZG2/fmgmiNzYK9qWRh8h/CHrwD0mo1h1DzL4yzHNSfWYujGTYsWGreD000gcgmZ7K4Ys6Tx9TxtsKdDw=="],
 
-    "@onlyne/lib": ["@onlyne/lib@3.0.0", "", {}, "sha512-VZLfOUpW0LpXEXrUlLJCWSDENvxvynXbBzM4A+poq0/VFfN9NmR9zE5UF5Cb3ieHF+k+DzacctWp75cEtMwK7g=="],
+    "@onlyne/lib": ["@onlyne/lib@3.1.0", "", {}, "sha512-eUstiLK/hWVtkcmNjjvBCVs/nRvIl87lqfKF2lbxkBoKtX4yFqe6sjU1sNxtM38fS3rXcYj79rgCBAHZM5nT1A=="],
 
-    "@onlyne/node-host": ["@onlyne/node-host@3.0.0", "", { "dependencies": { "@onlyne/lib": "^3.0.0", "bonjour-service": "^1.4.4" } }, "sha512-gJ+lL5JEG8W9XxFSXy3yNHru+ZxMSufOjQ4pihighd4F9q2wh4fSH33p1wDBNLJxcxcZ8k9WtQEzlD98TxUlng=="],
+    "@onlyne/node-host": ["@onlyne/node-host@3.1.0", "", { "dependencies": { "@onlyne/lib": "^3.1.0", "bonjour-service": "^1.4.4" } }, "sha512-kcbbYdbyw675Nt96vS5/OaKqXgMoOldIehVcUqfveXpGolXYkaef1F87zrrx2mXRl9bfRq68VSwgxrx/N7bzIg=="],
 
     "@types/bun": ["@types/bun@1.4.4", "", { "dependencies": { "bun-types": "1.4.4" } }, "sha512-9wkRDXUXK124pEnAutE6n/l18j+i9GC5IAHK8TmX/2nlySETmky0OU6yL5U8pW1AoKh++AN9auDCr647BfurjQ=="],
 

@@ -15,7 +15,8 @@ export interface ChoiceQuestion {
 export interface NoulQuestion {
 	type: "noul";
 	instructions: string;
-	criteria?: { true?: string; false?: string };
+	/** The service validates both keys present or both absent; a one-sided record fails at the wire. */
+	criteria: { true: string; false: string };
 }
 export type Question = ChoiceQuestion | NoulQuestion;
 export type Answers = Record<string, { choice?: string; noul?: number; type?: string }>;

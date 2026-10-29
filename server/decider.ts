@@ -45,6 +45,23 @@ const DOMAIN_OPS = ["create", "join", "leave", "list", "describe", "discover"] a
 const RESPONSES = ["none", "async", "await"] as const;
 const EXECUTIONS = ["existing", "new"] as const;
 
+/**
+ * One judgment sentence per op. The bare operation name gave the judge nothing to tell
+ * `join` from `list` or `describe` apart (a live run answered "帮我们加入研发域" with a
+ * near-uniform distribution), so each op now says what makes IT the answer.
+ */
+const OP_CRITERIA: Record<string, string> = {
+	create: "Start a new one of this kind: an empty thread, or a fresh domain membership record.",
+	close: "End or retire a thread that already exists.",
+	list: "Show the existing items without opening any of them.",
+	describe: "Show the details of one item: a thread's members, or one membership record.",
+	member_add: "Put a peer into an existing thread, so it reads and posts there.",
+	member_remove: "Take a peer out of an existing thread.",
+	join: "Enter a domain this node is not in yet; the message names or implies which domain to enter.",
+	leave: "Withdraw from a domain this node belongs to.",
+	discover: "Ask a domain who its members are.",
+};
+
 function record(value: unknown): Record<string, Json> | undefined {
 	return value !== null && typeof value === "object" && !Array.isArray(value) ? value as Record<string, Json> : undefined;
 }
@@ -85,7 +102,21 @@ export class CarlyDecider {
 
 	async decide(input: MsgInput): Promise<Action> {
 		const action = await this.#route(input);
-		return action.kind === "send" ? this.#land(action) : action;
+		if (action.kind !== "send") return action;
+		const mentioned = action.mentions === undefined
+			? action
+			: { ...action, mentions: await this.#mentionIds(action.mentions) };
+		return this.#land(mentioned);
+	}
+
+	/**
+	 * One spelling for every mention, whichever route produced the action: `@all` stays as it is,
+	 * and a name becomes the `@`-prefixed node id the library matches against.
+	 */
+	async #mentionIds(mentions: readonly string[]): Promise<string[]> {
+		return Promise.all(mentions.map(async item => item === "@all"
+			? "@all"
+			: item.startsWith("@") ? `@${await this.#peerId(item.slice(1))}` : await this.#peerId(item)));
 	}
 
 	/** The decision tree. It never picks a thread: that is `#land`'s deterministic job. */
@@ -96,8 +127,8 @@ export class CarlyDecider {
 		const intent = await this.#intent(input);
 		if (intent === "communicate") return this.#communicate(input, meta);
 		if (intent === "inspect") return this.#inspect(input, meta);
-		if (intent === "manage_thread") return this.#thread(meta);
-		if (intent === "manage_domain") return this.#domain(meta);
+		if (intent === "manage_thread") return this.#thread(input, meta);
+		if (intent === "manage_domain") return this.#domain(input, meta);
 		const resource = record(meta.resource);
 		const operation = text(meta, "operation");
 		if (resource === undefined || operation === undefined) {
@@ -190,9 +221,9 @@ export class CarlyDecider {
 					type: "choice",
 					instructions: "Choose the one action this message asks for. communicate: deliver a message, reply or progress note to another agent. inspect: look up local or network state. manage_thread: create, close, describe or change members of a thread. manage_domain: manage this node's domain membership. operate_resource: operate a resource the message names explicitly.",
 					criteria: {
-						communicate: "The message is meant for another agent or node, including asking a peer something.",
+						communicate: "The message is meant for another agent or node: delivering, replying, asking, reporting, or starting a new task or topic with one.",
 						inspect: "The message asks to see node-level state: who is online, the inbox, a thread's messages, one message, or delivery evidence.",
-						manage_thread: "The message works on threads themselves: list, describe, create, close, add or remove a member.",
+						manage_thread: "The message operates on thread records themselves: list, describe, create, close, add or remove a member. Starting a new task or conversation with a peer is communicate, not this.",
 						manage_domain: "The message changes or reads this node's domain membership.",
 						operate_resource: "meta.resource names an external resource to operate.",
 					},
@@ -204,7 +235,7 @@ export class CarlyDecider {
 	}
 
 	async #communicate(input: MsgInput, meta: Record<string, Json>): Promise<Action> {
-		const reply = messageRef(meta.in_reply_to);
+		const reply = await this.#replyRef(meta);
 		const relation = oneOf(meta.relation, ["reply", "followup"] as const, "relation") ?? (reply === undefined ? undefined : "reply");
 		if (relation !== undefined && reply === undefined) throw new OnlyneError("invalid_request", "A relation needs meta.in_reply_to.");
 		const to = await this.#target(input, meta, reply);
@@ -214,23 +245,48 @@ export class CarlyDecider {
 		const plan = response !== undefined && execution !== undefined
 			? { response, execution }
 			: await this.#plan(input, relation !== undefined);
-		const mentions = Array.isArray(meta.mentions)
-			? meta.mentions.filter((value): value is string => typeof value === "string")
-			: undefined;
 		return {
 			kind: "send", to,
 			...(thread === undefined ? {} : { thread }),
 			...(reply === undefined ? {} : { in_reply_to: reply }),
 			...(relation === undefined ? {} : { relation }),
-			...(mentions === undefined || mentions.length === 0 ? {} : { mentions }),
 			response: plan.response, execution: plan.execution,
 		};
+	}
+
+	/**
+	 * The reply reference with its sender normalized: `carly` and the full urn name one node,
+	 * and the ref travels with the resolved id so the peer's own records match it. A sender no
+	 * known source can resolve stays as written — a reply to an original this node cannot see
+	 * goes through the reply authority, and the receiver resolves the landing from its record.
+	 */
+	async #replyRef(meta: Record<string, Json>): Promise<MessageRef | undefined> {
+		const ref = messageRef(meta.in_reply_to);
+		if (ref === undefined) return undefined;
+		return { ...ref, sender: await this.#peerId(ref.sender).catch(() => ref.sender) };
+	}
+
+	/**
+	 * Resolve a spelled target to a node id against the same set every lookup answers from:
+	 * this node, each peer trust keeps, and each peer discovery reports. Identity outlives a
+	 * discovery record; whether the address works is the transport's `unavailable`, never a
+	 * reason to claim no such node exists.
+	 */
+	async #peerId(alias: string): Promise<NodeId> {
+		const ids = [this.deps.nodeId, ...(await this.deps.listPeers()).map(peer => peer.node_id)];
+		if (alias === "self") return this.deps.nodeId;
+		const unique = [...new Set(ids)];
+		if (unique.includes(alias)) return alias;
+		const matches = unique.filter(id => id.slice(id.lastIndexOf(":") + 1) === alias);
+		if (matches.length === 1) return matches[0]!;
+		if (matches.length > 1) throw new OnlyneError("ambiguous_target", `${alias} names more than one known node: ${matches.join(", ")}.`);
+		throw new OnlyneError("not_found", `No known node is named ${alias}. Known: ${unique.join(", ")}.`);
 	}
 
 	async #target(input: MsgInput, meta: Record<string, Json>, reply: MessageRef | undefined): Promise<NodeId> {
 		if (reply !== undefined) return reply.sender;
 		const explicit = text(meta, "to");
-		if (explicit !== undefined) return explicit;
+		if (explicit !== undefined) return this.#peerId(explicit);
 		const peers = await this.deps.listPeers();
 		if (peers.length === 0) throw new OnlyneError("not_found", "No peer is known yet; discover or add one first.");
 		if (peers.length === 1) return peers[0]!.node_id;
@@ -258,7 +314,8 @@ export class CarlyDecider {
 		const matches = threads.filter(thread => thread.thread_ref.id === value || thread.title === value);
 		if (matches.length > 1) throw new OnlyneError("ambiguous_target", `More than one local thread is named ${value}.`);
 		if (matches.length === 1) return matches[0]!.thread_ref;
-		const slash = value.indexOf("/");
+		// One slash grammar: the owner is the part before the LAST slash, safe for urn owners.
+		const slash = value.lastIndexOf("/");
 		if (slash > 0 && slash < value.length - 1) return { owner: value.slice(0, slash), id: value.slice(slash + 1) };
 		return { owner: to, id: value };
 	}
@@ -332,8 +389,8 @@ export class CarlyDecider {
 		return scope;
 	}
 
-	async #thread(meta: Record<string, Json>): Promise<Action> {
-		const op = oneOf(meta.op, THREAD_OPS, "op") ?? await this.#op("thread", THREAD_OPS);
+	async #thread(input: MsgInput, meta: Record<string, Json>): Promise<Action> {
+		const op = oneOf(meta.op, THREAD_OPS, "op") ?? await this.#op("thread", THREAD_OPS, input);
 		const thread = threadRef(meta.thread);
 		const member = text(meta, "member");
 		const title = text(meta, "title");
@@ -347,21 +404,21 @@ export class CarlyDecider {
 			...(title === undefined ? {} : { title }) };
 	}
 
-	async #domain(meta: Record<string, Json>): Promise<Action> {
-		const op = oneOf(meta.op, DOMAIN_OPS, "op") ?? await this.#op("domain", DOMAIN_OPS);
+	async #domain(input: MsgInput, meta: Record<string, Json>): Promise<Action> {
+		const op = oneOf(meta.op, DOMAIN_OPS, "op") ?? await this.#op("domain", DOMAIN_OPS, input);
 		const domain = text(meta, "domain_id");
 		if (op !== "create" && op !== "list" && domain === undefined) throw new OnlyneError("invalid_request", `A domain ${op} needs meta.domain_id.`);
 		return { kind: "domain", op, ...(domain === undefined ? {} : { domain_id: domain }) };
 	}
 
-	async #op<T extends string>(kind: "thread" | "domain", allowed: readonly T[]): Promise<T> {
+	async #op<T extends string>(kind: "thread" | "domain", allowed: readonly T[], input: MsgInput): Promise<T> {
 		const answers = await judge(this.deps.judge,
-			{ focus: { kind, meta: null } },
+			{ focus: { kind, delivery_kind: input.delivery_kind, msg: input.msg, meta: input.meta ?? null } },
 			{
 				op: {
 					type: "choice",
 					instructions: `Choose the ${kind} operation this message asks for.`,
-					criteria: Object.fromEntries(allowed.map(value => [value, value])),
+					criteria: Object.fromEntries(allowed.map(value => [value, OP_CRITERIA[value] ?? value])),
 				},
 			});
 		const op = choice(answers, "op", allowed);
@@ -392,8 +449,8 @@ export class CarlyDecider {
 			{
 				needs_answer: {
 					type: "noul",
-					instructions: "Does this message need a reply from the receiver to be complete? A question, a request, or a decision owed to the sender needs one. A notice, greeting, status update or relay does not.",
-					criteria: { true: "The sender is waiting for information or a decision.", false: "Nothing is owed back." },
+					instructions: "Does this message need a response from this node to be complete? A question, a request or work whose result must be reported back, a decision owed to the sender, or an instruction or correction this node must act on needs one. A notice, greeting, status update or relay does not.",
+					criteria: { true: "The sender is waiting for information or a decision, or expects this node to act on an instruction and follow through.", false: "Nothing is owed back." },
 				},
 			});
 		const needsAnswer = noul(answers, "needs_answer");

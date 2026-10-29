@@ -192,6 +192,8 @@ Inbound message text reaches Carly's prompt as untrusted input.
 bun install
 bun run check     # tsc --noEmit over server/
 bun run build     # bundle dist/companion.js
+bun run check:vendor   # report drift against packages/omp-onlyne/src
+bun scripts/judge-samples.ts   # real-judge samples against the System One endpoint
 tern plugin types .   # regenerate tern.d.luau for luau-lsp
 ```
 
@@ -199,9 +201,11 @@ tern plugin types .   # regenerate tern.d.luau for luau-lsp
 
 ## Vendored host wiring
 
-`server/vendor/omp-host/` carries five files copied from the Onlyne monorepo at `packages/omp-onlyne/src/`: `node.ts`, `store.ts`, `types.ts`, `host-text.ts` and `bridge-text.ts`. They build the protocol node for a host and implement SQLite storage and the context registry.
+`server/vendor/omp-host/` carries six files copied from the Onlyne monorepo at `packages/omp-onlyne/src/`: `node.ts`, `store.ts`, `types.ts`, `host-text.ts`, `bridge-text.ts` and `acquire.ts`. They build the protocol node for a host, implement SQLite storage and the context registry, and carry the acquisition policy the configuration types name.
 
-The copy lets this repository build against the published `@onlyne/lib` and `@onlyne/node-host` packages alone. A change to those five files in the monorepo has to be copied here, and a change here has to be copied back.
+The copy lets this repository build against the published `@onlyne/lib` and `@onlyne/node-host` packages alone. A change to those six files in the monorepo has to be copied here, and a change here has to be copied back.
+
+Each vendored file starts with a `// vendored from packages/omp-onlyne/src/<file>@<commit> (<date>)` line recording the monorepo commit it was copied at. `bun run check:vendor` compares all six against their upstream sources with comments stripped, so the annotations and upstream reference comments do not count, and prints one line per file: `same`, or `drifted` with `+N` upstream-only lines and `-N` vendor-only lines. It only reports and always exits 0; pass `--strict` to exit 1 on any drift. Run it from a checkout that has `packages/omp-onlyne/src/` as a sibling of `external-integrations/`.
 
 `server/paths.ts` holds the one path convention the plugin still needs from `packages/omp-onlyne/src/config.ts`.
 

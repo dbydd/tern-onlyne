@@ -11,11 +11,12 @@
 	},
 	"scripts": {
 		"check": "tsc --noEmit",
+		"check:vendor": "bun scripts/check-vendor.ts",
 		"build": "bun build server/main.ts --target=bun --outfile dist/companion.js"
 	},
 	"dependencies": {
-		"@onlyne/lib": "^3.0.0",
-		"@onlyne/node-host": "^3.0.0"
+		"@onlyne/lib": "^3.1.0",
+		"@onlyne/node-host": "^3.1.0"
 	},
 	"devDependencies": {
 		"@types/bun": "^1.4.4",
