@@ -266,6 +266,8 @@ interface StoredSettings {
 	node_id?: string;
 	region?: string;
 	bind?: string;
+	/** The port this companion last bound, written back on start so the address survives a restart. */
+	port?: number;
 	public_url?: string;
 	key_scope?: "project" | "none";
 	systemone?: Partial<JudgeConfig>;
@@ -284,17 +286,45 @@ async function readSettings(): Promise<StoredSettings> {
 	}
 }
 
+/**
+ * Writes the port this process actually bound back into `onlyne.config`, so the next start
+ * answers on the same address instead of asking the operating system for a new one. The file
+ * is the plugin's kv store: every other key is preserved, and a failure is logged rather than
+ * failing a companion that is already listening.
+ */
+async function persistPort(port: number): Promise<void> {
+	try {
+		const raw: unknown = JSON.parse(await readFile(kvPath, "utf8"));
+		if (raw === null || typeof raw !== "object" || Array.isArray(raw)) return;
+		const root = raw as Record<string, unknown>;
+		const current = root["onlyne.config"];
+		if (current === null || typeof current !== "object" || Array.isArray(current)) return;
+		await writeFile(kvPath, JSON.stringify({
+			...root,
+			"onlyne.config": { ...(current as Record<string, unknown>), port },
+		}), { mode: 0o600 });
+		log("onlyne.port.persisted", { port, path: kvPath });
+	} catch (error) {
+		log("onlyne.port.persist.failed", { port, error: error instanceof Error ? error.message : String(error) });
+	}
+}
+
 function toConfig(stored: StoredSettings, seeds: TrustSeed[]): OnlyneConfig {
 	if (stored.node_id === undefined || stored.region === undefined) {
 		throw new OnlyneError("unsupported_delivery", "Onlyne is not configured yet; open the Onlyne settings block in Tern.");
 	}
 	const keyed = stored.key_scope !== "none";
 	const publicUrl = stored.public_url?.trim();
+	const port = stored.port;
 	return {
 		path: configPath(dataDir),
 		region: stored.region,
 		node: { id: stored.node_id, ...(keyed ? { key_ref: "plugin-data:node-key.json" } : { key_scope: "none" as const }) },
-		server: { bind: stored.bind ?? "127.0.0.1", ...(publicUrl === undefined || publicUrl === "" ? {} : { public_url: publicUrl }) },
+		server: {
+			bind: stored.bind ?? "127.0.0.1",
+			...(typeof port === "number" && Number.isInteger(port) && port > 0 && port <= 65535 ? { port } : {}),
+			...(publicUrl === undefined || publicUrl === "" ? {} : { public_url: publicUrl }),
+		},
 		threads: { page_size: 50 },
 		...(seeds.length === 0 ? {} : { trust: seeds }),
 	};
@@ -511,6 +541,9 @@ if (publicUrl !== undefined) {
 	if (await locallyBindable(parsed.hostname)) wanted = publicPort(publicUrl);
 	else proxied = true;
 }
+// A proxy declaration owns the published address, so its local port stays ephemeral. Every
+// other start reuses the port this companion bound last time.
+if (wanted === 0 && !proxied) wanted = config.server.port ?? 0;
 
 const listening = (port: number) => Bun.serve({
 	hostname: config.server.bind,
@@ -641,6 +674,8 @@ try {
 	log("onlyne.port.unavailable", { port: wanted, error: error instanceof Error ? error.message : String(error) });
 	server = listening(0);
 }
+const boundPort = server.port;
+if (!proxied && boundPort !== undefined && boundPort !== config.server.port) await persistPort(boundPort);
 
 const host = advertisedHost(config.server.bind);
 // A peer stores whatever address the introduction carried, so the endpoint must name the port

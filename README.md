@@ -48,6 +48,8 @@ The plugin keeps its configuration in `onlyne.config` inside the plugin's kv sto
 
 `public_url` is judged by its host first. A loopback name, one of this machine's own addresses, or a name resolving to either, is a local bind: its declared port is bound here (a URL without one names 443 or 80), and a taken port falls back to a temporary one with the endpoint rewritten to the address really bound. Anything else is a reverse proxy: the endpoint stays exactly as declared, the process binds `bind` on a temporary port, and the startup log says it does not listen on the advertised port.
 
+Without a `public_url`, the companion remembers the port it bound in `onlyne.config.port` and reuses it on the next start, so an address a peer recorded keeps working. A port that is already taken falls back to a temporary one, and the new port is remembered instead.
+
 ## Exports
 
 Carly reaches these as `plugins["onlyne"]`.
